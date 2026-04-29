@@ -8,6 +8,11 @@ import uuid
 import html
 import tempfile
 import traceback
+import pickle
+import hashlib
+import hmac
+import secrets
+from http.cookies import SimpleCookie
 from datetime import datetime, date, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
@@ -27,7 +32,183 @@ PORT = int(os.environ.get("PORT", 8090))
 APP_DIR = r"C:\IA\Projeto"
 UPLOAD_DIR = os.path.join(APP_DIR, "uploads_sla") if os.name == "nt" else tempfile.gettempdir()
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# Pasta fixa para guardar a análise processada.
+# Antes o dashboard guardava tudo apenas na memória (CACHE = {}).
+# Quando o servidor reiniciava, dormia ou a plataforma online limpava a memória,
+# o token expirava e a tela pedia para subir a planilha novamente.
+# Agora cada análise fica salva em disco e pode ser consultada durante o dia todo.
+CACHE_DIR = os.path.join(APP_DIR, "cache_sla") if os.name == "nt" else os.path.join(tempfile.gettempdir(), "cache_sla")
+os.makedirs(CACHE_DIR, exist_ok=True)
 CACHE = {}
+CACHE_VALID_HOURS = int(os.environ.get("CACHE_VALID_HOURS", "36"))
+
+USERS_FILE = os.path.join(APP_DIR, "usuarios_sla.json") if os.name == "nt" else os.path.join(tempfile.gettempdir(), "usuarios_sla.json")
+SESSIONS = {}
+SESSION_HOURS = int(os.environ.get("SESSION_HOURS", "12"))
+ADMIN_LOGIN = os.environ.get("ADMIN_LOGIN", "admin")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "Admin@123")
+DEFAULT_CLIENT_PASSWORD_SUFFIX = os.environ.get("DEFAULT_CLIENT_PASSWORD_SUFFIX", "@123")
+
+def now_ts():
+    return datetime.now().timestamp()
+
+def hash_password(password, salt=None):
+    if salt is None:
+        salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 120000)
+    return salt + "$" + digest.hex()
+
+def check_password(password, stored_hash):
+    try:
+        salt, digest = stored_hash.split("$", 1)
+        test_hash = hash_password(password, salt).split("$", 1)[1]
+        return hmac.compare_digest(test_hash, digest)
+    except Exception:
+        return False
+
+def load_users():
+    if not os.path.exists(USERS_FILE):
+        users = {
+            ADMIN_LOGIN: {
+                "senha_hash": hash_password(ADMIN_PASSWORD),
+                "tipo": "admin",
+                "nome": "Administrador",
+                "cliente_codigo": "",
+                "cliente_nome": "",
+                "trocar_senha": True,
+            }
+        }
+        save_users(users)
+        return users
+    try:
+        with open(USERS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        traceback.print_exc()
+        return {}
+
+def save_users(users):
+    tmp = USERS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(users, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, USERS_FILE)
+
+def user_safe(u):
+    if not u:
+        return None
+    return {k: v for k, v in u.items() if k != "senha_hash"}
+
+def get_session_user(handler):
+    cookie_header = handler.headers.get("Cookie", "")
+    if not cookie_header:
+        return None
+    cookie = SimpleCookie()
+    try:
+        cookie.load(cookie_header)
+    except Exception:
+        return None
+    sid = cookie.get("sid")
+    if not sid:
+        return None
+    sid = sid.value
+    session = SESSIONS.get(sid)
+    if not session:
+        return None
+    if now_ts() - session.get("created", 0) > SESSION_HOURS * 3600:
+        SESSIONS.pop(sid, None)
+        return None
+    users = load_users()
+    login = session.get("login")
+    u = users.get(login)
+    if not u:
+        return None
+    u = dict(u)
+    u["login"] = login
+    return u
+
+def create_session(handler, login):
+    sid = secrets.token_urlsafe(32)
+    SESSIONS[sid] = {"login": login, "created": now_ts()}
+    handler.send_header("Set-Cookie", f"sid={sid}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_HOURS*3600}")
+
+def clear_session(handler):
+    handler.send_header("Set-Cookie", "sid=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
+
+def normalize_cliente_codigo(v):
+    s = norm_text(v)
+    if s.endswith(".0"):
+        s = s[:-2]
+    return s
+
+def cliente_login_from_codigo(codigo):
+    codigo = re.sub(r"[^A-Za-z0-9_.-]", "_", normalize_cliente_codigo(codigo))
+    return f"cliente_{codigo}"
+
+def auto_create_client_users(rows):
+    """
+    Cria usuários de cliente automaticamente a partir da aba Rastreamento:
+    AF = código cliente
+    AG = nome cliente
+
+    Login gerado: cliente_<codigo>
+    Senha inicial: <codigo>@123
+    A senha fica criptografada no arquivo usuarios_sla.json.
+    """
+    users = load_users()
+    created = []
+    for r in rows:
+        codigo = normalize_cliente_codigo(r.get("cliente_codigo", ""))
+        nome = norm_text(r.get("cliente_nome", ""))
+        if not codigo:
+            continue
+        login = cliente_login_from_codigo(codigo)
+        if login in users:
+            if nome and not users[login].get("cliente_nome"):
+                users[login]["cliente_nome"] = nome
+            continue
+        senha_inicial = f"{codigo}{DEFAULT_CLIENT_PASSWORD_SUFFIX}"
+        users[login] = {
+            "senha_hash": hash_password(senha_inicial),
+            "tipo": "cliente",
+            "nome": nome or login,
+            "cliente_codigo": codigo,
+            "cliente_nome": nome,
+            "trocar_senha": True,
+        }
+        created.append((login, senha_inicial, codigo, nome))
+    if created:
+        save_users(users)
+    return created
+
+def latest_file_path():
+    return os.path.join(CACHE_DIR, "_latest_token.json")
+
+def save_latest_token(token):
+    with open(latest_file_path(), "w", encoding="utf-8") as f:
+        json.dump({"token": token, "updated_at": datetime.now().isoformat()}, f, ensure_ascii=False, indent=2)
+
+def load_latest_token():
+    path = latest_file_path()
+    if not os.path.exists(path):
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f).get("token", "")
+    except Exception:
+        return ""
+
+def filter_rows_for_user(rows, user):
+    if not user:
+        return []
+    if user.get("tipo") == "admin":
+        return rows
+    codigo = normalize_cliente_codigo(user.get("cliente_codigo", ""))
+    return [r for r in rows if normalize_cliente_codigo(r.get("cliente_codigo", "")) == codigo]
+
+def require_login_html():
+    return render_login("Faça login para acessar o sistema.")
+
 
 MONTHS_PT = {
     1: "Jan", 2: "Fev", 3: "Mar", 4: "Abr", 5: "Mai", 6: "Jun",
@@ -38,7 +219,7 @@ COLS = {
     "nf": 1, "data_inicial": 3, "uf_origem": 7, "tipo": 9, "entrega": 10,
     "link": 11, "destinatario": 13, "cidade_destino": 14, "uf_destino": 15,
     "data_entrega": 18, "ocorrencia": 19, "filial": 25, "sla": 28,
-    "parceiro": 29, "sla_justificado": 30, "uf_parceiro": 31
+    "parceiro": 29, "sla_justificado": 30, "uf_parceiro": 31, "cliente_codigo": 32, "cliente_nome": 33
 }
 
 def norm_text(v):
@@ -85,6 +266,52 @@ def fmt_date(d):
     if not d:
         return ""
     return d.strftime("%d/%m/%Y")
+
+
+def cache_file_path(token):
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "", token or "")
+    if not safe:
+        return ""
+    return os.path.join(CACHE_DIR, f"{safe}.pkl")
+
+def save_cache(token, rows):
+    """Salva a análise em disco para não expirar ao atualizar a página."""
+    payload = {
+        "created_at": datetime.now(),
+        "rows": rows,
+    }
+    path = cache_file_path(token)
+    with open(path, "wb") as f:
+        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+def load_cache(token):
+    """Carrega análise da memória ou do disco, mantendo disponível durante o dia."""
+    if token in CACHE:
+        return CACHE[token]
+
+    path = cache_file_path(token)
+    if not path or not os.path.exists(path):
+        return None
+
+    try:
+        with open(path, "rb") as f:
+            payload = pickle.load(f)
+        created_at = payload.get("created_at")
+        rows = payload.get("rows")
+        if not rows:
+            return None
+
+        if isinstance(created_at, datetime):
+            idade = datetime.now() - created_at
+            if idade > timedelta(hours=CACHE_VALID_HOURS):
+                return None
+
+        CACHE[token] = rows
+        return rows
+    except Exception:
+        traceback.print_exc()
+        return None
+
 
 def is_business_day(d, holidays):
     return d.weekday() < 5 and d not in holidays
@@ -228,6 +455,8 @@ def read_workbook(path):
             "sla": to_number(row[COLS["sla"]-1], 0),
             "parceiro": norm_text(row[COLS["parceiro"]-1]),
             "uf_parceiro": norm_text(row[COLS["uf_parceiro"]-1]) if len(row) >= COLS["uf_parceiro"] else "",
+            "cliente_codigo": normalize_cliente_codigo(row[COLS["cliente_codigo"]-1]) if len(row) >= COLS["cliente_codigo"] else "",
+            "cliente_nome": norm_text(row[COLS["cliente_nome"]-1]) if len(row) >= COLS["cliente_nome"] else "",
             "sla_justificado_raw": row[COLS["sla_justificado"]-1],
         }
         r["rota_uf"] = f'{r["uf_origem"]} x {r["uf_destino"]}'.strip(" x")
@@ -280,9 +509,9 @@ def make_summary(rows):
 def csv_bytes(rows):
     out = io.StringIO()
     w = csv.writer(out, delimiter=';')
-    w.writerow(["NF", "Status", "Data inicial", "Data prevista", "Data entrega", "Dias atraso", "Parceiro", "Filial", "Tipo", "UF origem", "UF destino", "Destinatario", "Ocorrencia", "Falta link"])
+    w.writerow(["NF", "Código Cliente", "Nome Cliente", "Status", "Data inicial", "Data prevista", "Data entrega", "Dias atraso", "Parceiro", "Filial", "Tipo", "UF origem", "UF destino", "Destinatario", "Ocorrencia", "Falta link"])
     for r in rows:
-        w.writerow([r["nf"], r["status"], fmt_date(r["data_inicial"]), fmt_date(r["data_prevista"]), fmt_date(r["data_entrega"]), r["dias_atraso"], r["parceiro"], r["filial"], r["tipo"], r["uf_origem"], r["uf_destino"], r["destinatario"], r["ocorrencia"], "SIM" if r["falta_link"] else "NAO"])
+        w.writerow([r["nf"], r.get("cliente_codigo", ""), r.get("cliente_nome", ""), r["status"], fmt_date(r["data_inicial"]), fmt_date(r["data_prevista"]), fmt_date(r["data_entrega"]), r["dias_atraso"], r["parceiro"], r["filial"], r["tipo"], r["uf_origem"], r["uf_destino"], r["destinatario"], r["ocorrencia"], "SIM" if r["falta_link"] else "NAO"])
     return out.getvalue().encode("utf-8-sig")
 
 def table_rows(rows, limit=300):
@@ -516,8 +745,71 @@ def render_charts(rows):
     </div>
     """
 
+def render_login(msg=""):
+    return f"""<!doctype html><html lang='pt-br'><head><meta charset='utf-8'><title>Login - Dashboard SLA SIN</title>{CSS}</head><body>
+    <div class='login_wrap'>
+        <div class='login_card'>
+            <div class='login_brand'>
+                <h1>Dashboard SLA SIN</h1>
+                <p>ADM Empresa + Pesquisa Cliente</p>
+            </div>
+            {'<div class=err>'+html.escape(msg)+'</div>' if msg else ''}
+            <form method='post' action='/login' class='login_form'>
+                <label>Usuário</label>
+                <input type='text' name='login' autocomplete='username' required>
+                <label>Senha</label>
+                <input type='password' name='senha' autocomplete='current-password' required>
+                <button>Entrar</button>
+            </form>
+            <div class='note'>Admin padrão inicial: admin / Admin@123. Altere a senha antes de publicar.</div>
+        </div>
+    </div></body></html>"""
+
+def render_change_password(user, msg=""):
+    return f"""<!doctype html><html lang='pt-br'><head><meta charset='utf-8'><title>Alterar senha</title>{CSS}</head><body>
+    <div class='login_wrap'>
+        <div class='login_card'>
+            <div class='login_brand'><h1>Alterar senha</h1><p>Usuário: {html.escape(user.get('login',''))}</p></div>
+            {'<div class=err>'+html.escape(msg)+'</div>' if msg else ''}
+            <form method='post' action='/alterar_senha' class='login_form'>
+                <label>Senha atual</label>
+                <input type='password' name='senha_atual' required>
+                <label>Nova senha</label>
+                <input type='password' name='nova_senha' minlength='6' required>
+                <label>Confirmar nova senha</label>
+                <input type='password' name='confirmar_senha' minlength='6' required>
+                <button>Salvar nova senha</button>
+            </form>
+        </div>
+    </div></body></html>"""
+
+def render_clientes_admin(rows, created_users=None):
+    clientes = {}
+    for r in rows:
+        codigo = normalize_cliente_codigo(r.get("cliente_codigo", ""))
+        if not codigo:
+            continue
+        if codigo not in clientes:
+            clientes[codigo] = {"nome": r.get("cliente_nome", ""), "qtd": 0}
+        clientes[codigo]["qtd"] += 1
+    itens = sorted(clientes.items(), key=lambda x: x[1]["qtd"], reverse=True)
+    trs = []
+    for codigo, info in itens[:300]:
+        login = cliente_login_from_codigo(codigo)
+        trs.append(f"<tr><td>{html.escape(codigo)}</td><td>{html.escape(info['nome'])}</td><td>{html.escape(login)}</td><td>{info['qtd']}</td></tr>")
+    novos = ""
+    if created_users:
+        linhas = "".join(f"<tr><td>{html.escape(a)}</td><td>{html.escape(b)}</td><td>{html.escape(c)}</td><td>{html.escape(d)}</td></tr>" for a,b,c,d in created_users[:300])
+        novos = f"<div class='card'><h2>Novos usuários criados</h2><p class='sub'>Senha inicial gerada. Oriente o cliente a trocar no primeiro acesso.</p><div class='tablebox'><table><tr><th>Login</th><th>Senha inicial</th><th>Código</th><th>Cliente</th></tr>{linhas}</table></div></div>"
+    return f"""<!doctype html><html lang='pt-br'><head><meta charset='utf-8'><title>Clientes</title>{CSS}</head><body>
+    <div class='wrap wide'>
+        <div class='top'><div><h1>Clientes identificados</h1><p>Baseada na aba Rastreamento: AF código cliente e AG nome cliente.</p></div><div class='actions'><a class='btn secondary' href='/dashboard'>Voltar</a><a class='btn secondary' href='/logout'>Sair</a></div></div>
+        {novos}
+        <div class='card'><h2>Relação de clientes</h2><div class='tablebox'><table><tr><th>Código Cliente</th><th>Nome Cliente</th><th>Login</th><th>Demandas</th></tr>{''.join(trs)}</table></div></div>
+    </div></body></html>"""
+
 def render_upload(msg=""):
-    return f"""<!doctype html><html lang='pt-br'><head><meta charset='utf-8'><title>Dashboard SLA SIN</title>{CSS}</head><body><div class='wrap'><div class='hero'><h1>Dashboard SLA SIN</h1><p>Suba a planilha Excel com as abas Rastreamento, ocorrencias e Feriado - final de semana.</p></div>{'<div class=err>'+html.escape(msg)+'</div>' if msg else ''}<form class='upload' method='post' enctype='multipart/form-data' action='/analisar'><input type='file' name='file' accept='.xlsx,.xlsm' required><button>Analisar planilha</button></form><div class='note'>Colunas usadas: Rastreamento C, I, K, R, S, Y, AB, AC, AD e aba de feriados.</div></div></body></html>"""
+    return f"""<!doctype html><html lang='pt-br'><head><meta charset='utf-8'><title>Dashboard SLA SIN</title>{CSS}</head><body><div class='wrap'><div class='hero'><h1>Dashboard SLA SIN</h1><p>Área ADM: suba a planilha Excel uma vez ao dia. Clientes consultam apenas suas demandas.</p></div>{'<div class=err>'+html.escape(msg)+'</div>' if msg else ''}<form class='upload' method='post' enctype='multipart/form-data' action='/analisar'><input type='file' name='file' accept='.xlsx,.xlsm' required><button>Analisar planilha</button></form><div class='note'>Colunas usadas: Rastreamento C, I, K, R, S, Y, AB, AC, AD, AF código cliente, AG nome cliente e aba de feriados.</div></div></body></html>"""
 
 def page_link(token, kind):
     return f"/pagina?token={token}&tipo={kind}"
@@ -531,7 +823,7 @@ def resumo_card(title, value, subtitle, href, css_class="blue"):
     </a>
     """
 
-def render_dashboard(rows, token):
+def render_dashboard(rows, token, user=None):
     s = make_summary(rows)
     total = max(1, s["total"])
     atrasados = [r for r in rows if r["status"] in ("Entregue atrasado", "Entregue atrasado - Justificado")]
@@ -562,8 +854,8 @@ def render_dashboard(rows, token):
     return f"""<!doctype html><html lang='pt-br'><head><meta charset='utf-8'><title>Dashboard SLA SIN</title>{CSS}</head><body>
     <div class='wrap wide'>
         <div class='top'>
-            <div><h1>Dashboard SLA SIN</h1><p>Base analisada em {datetime.now().strftime('%d/%m/%Y %H:%M')} | Total: <b>{s['total']}</b></p></div>
-            <a class='btn' href='/'>Nova análise</a>
+            <div><h1>Dashboard SLA SIN</h1><p>Usuário: <b>{html.escape((user or {}).get('nome',''))}</b> | Perfil: <b>{html.escape((user or {}).get('tipo',''))}</b> | Base analisada em {datetime.now().strftime('%d/%m/%Y %H:%M')} | Total: <b>{s['total']}</b> | Consulta ativa por até {CACHE_VALID_HOURS}h</p></div>
+            <div class='actions'>{"<a class='btn' href='/'>Nova análise</a><a class='btn secondary' href='/clientes'>Clientes</a>" if (user or {}).get('tipo') == 'admin' else ""}<a class='btn secondary' href='/alterar_senha'>Senha</a><a class='btn secondary' href='/logout'>Sair</a></div>
         </div>
 
         <section class='grid kpis'>
@@ -592,7 +884,7 @@ def render_dashboard(rows, token):
         </section>
     </div></body></html>"""
 
-def render_detail_page(rows, token, kind):
+def render_detail_page(rows, token, kind, user=None):
     atrasados = [r for r in rows if r["status"] in ("Entregue atrasado", "Entregue atrasado - Justificado")]
     aberto_atraso = sorted([r for r in rows if r["status"] == "Em aberto com atraso"], key=lambda r: r["dias_atraso"], reverse=True)
     aberto_prazo = sorted([r for r in rows if r["status"] == "Em aberto no prazo"], key=lambda r: r["data_prevista"] or date.max)
@@ -626,7 +918,7 @@ def render_detail_page(rows, token, kind):
     <div class='wrap wide'>
         <div class='top'>
             <div><h1>{html.escape(title)}</h1><p>Análise individual do ponto selecionado.</p></div>
-            <div class='actions'><a class='btn secondary' href='/dashboard?token={token}'>Voltar ao resumo</a>{download}</div>
+            <div class='actions'><a class='btn secondary' href='/dashboard'>Voltar ao resumo</a>{download}</div>
         </div>
         {content}
     </div></body></html>"""
@@ -788,51 +1080,133 @@ table{border-collapse:collapse;width:100%;font-size:13px}th,td{border-bottom:1px
 .dot.atraso{background:#f05a1a}
 .dot.just{background:#a20db5}
 
+
+.login_wrap{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;background:linear-gradient(135deg,#eaf4fb,#f3fbf6)}
+.login_card{width:100%;max-width:430px;background:#fff;border-radius:20px;padding:28px;box-shadow:0 14px 34px rgba(31,63,94,.14);border:1px solid #e3edf5}
+.login_brand{background:linear-gradient(135deg,#0b6b8f,#10b36a);color:#fff;border-radius:16px;padding:20px;margin-bottom:18px}
+.login_brand h1{font-size:25px;margin-bottom:6px}.login_brand p{margin:0;opacity:.95}
+.login_form{display:flex;flex-direction:column;gap:9px}
+.login_form label{font-weight:700;color:#344b5a;font-size:13px}
+.login_form input{padding:13px 14px;border:1px solid #cbdce8;border-radius:12px;font-size:15px}
+.login_form button{margin-top:8px}
 @media(max-width:1200px){.home_layout{grid-template-columns:1fr}.charts_grid.clean{grid-template-columns:1fr 1fr}}
 @media(max-width:1000px){.kpis,.two,.menu_grid.compact,.charts_grid.clean{grid-template-columns:1fr}.upload,.top{display:block}.btn{margin-top:12px}.actions{display:block}.home_layout{grid-template-columns:1fr}}
 </style>"""
 
+
 class App(BaseHTTPRequestHandler):
-    def send_html(self, body, code=200):
+    def send_html(self, body, code=200, extra_headers=None):
         data = body.encode("utf-8")
         self.send_response(code)
+        if extra_headers:
+            for k, v in extra_headers:
+                self.send_header(k, v)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
 
+    def redirect(self, location, extra_headers=None):
+        self.send_response(302)
+        if extra_headers:
+            for k, v in extra_headers:
+                self.send_header(k, v)
+        self.send_header("Location", location)
+        self.end_headers()
+
+    def read_form_urlencoded(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length).decode("utf-8", "ignore")
+        data = parse_qs(raw)
+        return {k: v[0] if v else "" for k, v in data.items()}
+
+    def current_rows_and_token(self, user):
+        token = load_latest_token()
+        rows = load_cache(token) if token else None
+        if not rows:
+            return None, token
+        return filter_rows_for_user(rows, user), token
+
     def do_GET(self):
         parsed = urlparse(self.path)
+
+        if parsed.path == "/login":
+            self.send_html(render_login())
+            return
+
+        if parsed.path == "/logout":
+            self.send_response(302)
+            clear_session(self)
+            self.send_header("Location", "/login")
+            self.end_headers()
+            return
+
+        user = get_session_user(self)
+        if not user:
+            self.send_html(render_login("Faça login para acessar."), 401)
+            return
+
+        if user.get("trocar_senha") and parsed.path not in ("/alterar_senha",):
+            self.send_html(render_change_password(user, "Por segurança, altere sua senha inicial."))
+            return
+
+        if parsed.path == "/alterar_senha":
+            self.send_html(render_change_password(user))
+            return
+
         if parsed.path == "/":
+            if user.get("tipo") != "admin":
+                self.redirect("/dashboard")
+                return
             self.send_html(render_upload())
             return
+
+        if parsed.path == "/clientes":
+            if user.get("tipo") != "admin":
+                self.send_html(render_login("Acesso restrito ao administrador."), 403)
+                return
+            rows, token = self.current_rows_and_token(user)
+            if rows is None:
+                self.send_html(render_upload("Nenhuma análise carregada ainda. Suba a planilha."))
+                return
+            self.send_html(render_clientes_admin(rows))
+            return
+
         if parsed.path == "/dashboard":
             qs = parse_qs(parsed.query)
-            token = qs.get("token", [""])[0]
-            rows = CACHE.get(token)
+            token = qs.get("token", [""])[0] or load_latest_token()
+            rows = load_cache(token) if token else None
             if not rows:
-                self.send_html(render_upload("Analise expirada. Suba a planilha novamente."), 404)
+                if user.get("tipo") == "admin":
+                    self.send_html(render_upload("Analise nao encontrada ou vencida. Suba a planilha novamente."), 404)
+                else:
+                    self.send_html(render_login("Nenhuma pesquisa disponível para seu cliente no momento."), 404)
                 return
-            self.send_html(render_dashboard(rows, token))
+            rows_user = filter_rows_for_user(rows, user)
+            self.send_html(render_dashboard(rows_user, token, user))
             return
+
         if parsed.path == "/pagina":
             qs = parse_qs(parsed.query)
-            token = qs.get("token", [""])[0]
+            token = qs.get("token", [""])[0] or load_latest_token()
             tipo = qs.get("tipo", ["prazo_rota"])[0]
-            rows = CACHE.get(token)
+            rows = load_cache(token) if token else None
             if not rows:
-                self.send_html(render_upload("Analise expirada. Suba a planilha novamente."), 404)
+                self.send_html(render_login("Analise nao encontrada ou vencida."), 404)
                 return
-            self.send_html(render_detail_page(rows, token, tipo))
+            rows_user = filter_rows_for_user(rows, user)
+            self.send_html(render_detail_page(rows_user, token, tipo, user))
             return
+
         if parsed.path == "/download":
             qs = parse_qs(parsed.query)
-            token = qs.get("token", [""])[0]
+            token = qs.get("token", [""])[0] or load_latest_token()
             tipo = qs.get("tipo", ["todos"])[0]
-            rows = CACHE.get(token)
+            rows = load_cache(token) if token else None
             if not rows:
-                self.send_html(render_upload("Analise expirada. Suba a planilha novamente."), 404)
+                self.send_html(render_login("Analise nao encontrada ou vencida."), 404)
                 return
+            rows = filter_rows_for_user(rows, user)
             filters = {
                 "aberto_atrasado": lambda r: r["status"] == "Em aberto com atraso",
                 "aberto_prazo": lambda r: r["status"] == "Em aberto no prazo",
@@ -849,12 +1223,62 @@ class App(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(data)
             return
-        self.send_html(render_upload("Pagina nao encontrada."), 404)
+
+        self.send_html(render_login("Pagina nao encontrada."), 404)
 
     def do_POST(self):
-        if urlparse(self.path).path != "/analisar":
-            self.send_html(render_upload("Rota invalida."), 404)
+        parsed = urlparse(self.path)
+
+        if parsed.path == "/login":
+            form = self.read_form_urlencoded()
+            login = norm_text(form.get("login", ""))
+            senha = form.get("senha", "")
+            users = load_users()
+            u = users.get(login)
+            if not u or not check_password(senha, u.get("senha_hash", "")):
+                self.send_html(render_login("Usuário ou senha inválidos."), 401)
+                return
+            self.send_response(302)
+            create_session(self, login)
+            self.send_header("Location", "/dashboard" if u.get("tipo") != "admin" else "/")
+            self.end_headers()
             return
+
+        user = get_session_user(self)
+        if not user:
+            self.send_html(render_login("Faça login para acessar."), 401)
+            return
+
+        if parsed.path == "/alterar_senha":
+            form = self.read_form_urlencoded()
+            senha_atual = form.get("senha_atual", "")
+            nova = form.get("nova_senha", "")
+            confirmar = form.get("confirmar_senha", "")
+            users = load_users()
+            stored = users.get(user["login"], {})
+            if not check_password(senha_atual, stored.get("senha_hash", "")):
+                self.send_html(render_change_password(user, "Senha atual incorreta."), 400)
+                return
+            if len(nova) < 6:
+                self.send_html(render_change_password(user, "A nova senha precisa ter pelo menos 6 caracteres."), 400)
+                return
+            if nova != confirmar:
+                self.send_html(render_change_password(user, "A confirmação não confere."), 400)
+                return
+            users[user["login"]]["senha_hash"] = hash_password(nova)
+            users[user["login"]]["trocar_senha"] = False
+            save_users(users)
+            self.redirect("/dashboard" if user.get("tipo") != "admin" else "/")
+            return
+
+        if parsed.path != "/analisar":
+            self.send_html(render_login("Rota invalida."), 404)
+            return
+
+        if user.get("tipo") != "admin":
+            self.send_html(render_login("Somente o administrador pode subir planilha."), 403)
+            return
+
         try:
             ctype = self.headers.get("Content-Type", "")
             m = re.search("boundary=(.*)", ctype)
@@ -884,12 +1308,21 @@ class App(BaseHTTPRequestHandler):
             rows, holidays = read_workbook(path)
             token = uuid.uuid4().hex
             CACHE[token] = rows
-            self.send_html(render_dashboard(rows, token))
+            save_cache(token, rows)
+            save_latest_token(token)
+            created = auto_create_client_users(rows)
+            if created:
+                self.send_html(render_clientes_admin(rows, created))
+            else:
+                self.send_html(render_dashboard(rows, token, user))
         except Exception as e:
             traceback.print_exc()
             self.send_html(render_upload("Erro ao analisar: " + str(e)), 500)
 
 if __name__ == "__main__":
+    load_users()
     print("Dashboard SLA SIN iniciado")
     print(f"Abra no navegador: http://{HOST}:{PORT}")
+    print(f"Login admin inicial: {ADMIN_LOGIN}")
+    print("Senha admin inicial: definida por ADMIN_PASSWORD ou Admin@123")
     HTTPServer((HOST, PORT), App).serve_forever()
