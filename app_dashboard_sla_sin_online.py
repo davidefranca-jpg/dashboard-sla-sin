@@ -42,124 +42,6 @@ CACHE_DIR = os.path.join(APP_DIR, "cache_sla") if os.name == "nt" else os.path.j
 os.makedirs(CACHE_DIR, exist_ok=True)
 CACHE = {}
 
-# =========================
-# SEGURANÇA / LOGIN
-# =========================
-USERS_FILE = os.path.join(APP_DIR, "usuarios_sla.json") if os.name == "nt" else os.path.join(tempfile.gettempdir(), "usuarios_sla.json")
-SESSIONS = {}
-SESSION_HOURS = int(os.environ.get("SESSION_HOURS", "12"))
-
-ADMIN_LOGIN = os.environ.get("ADMIN_LOGIN", "admin")
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "Admin@123")
-
-def now_ts():
-    return datetime.now().timestamp()
-
-def hash_password(password, salt=None):
-    if salt is None:
-        salt = secrets.token_hex(16)
-    digest = hashlib.pbkdf2_hmac(
-        "sha256",
-        password.encode("utf-8"),
-        salt.encode("utf-8"),
-        120000
-    )
-    return salt + "$" + digest.hex()
-
-def check_password(password, stored_hash):
-    try:
-        salt, digest = stored_hash.split("$", 1)
-        test_hash = hash_password(password, salt).split("$", 1)[1]
-        return hmac.compare_digest(test_hash, digest)
-    except Exception:
-        return False
-
-def load_users():
-    if not os.path.exists(USERS_FILE):
-        users = {
-            ADMIN_LOGIN: {
-                "senha_hash": hash_password(ADMIN_PASSWORD),
-                "tipo": "admin",
-                "nome": "Administrador",
-                "trocar_senha": False,
-            }
-        }
-        save_users(users)
-        return users
-
-    try:
-        with open(USERS_FILE, "r", encoding="utf-8") as f:
-            users = json.load(f)
-    except Exception:
-        users = {}
-
-    if ADMIN_LOGIN not in users:
-        users[ADMIN_LOGIN] = {
-            "senha_hash": hash_password(ADMIN_PASSWORD),
-            "tipo": "admin",
-            "nome": "Administrador",
-            "trocar_senha": False,
-        }
-        save_users(users)
-
-    return users
-
-def save_users(users):
-    tmp = USERS_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(users, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, USERS_FILE)
-
-def get_session_user(handler):
-    cookie_header = handler.headers.get("Cookie", "")
-    if not cookie_header:
-        return None
-
-    cookie = SimpleCookie()
-    try:
-        cookie.load(cookie_header)
-    except Exception:
-        return None
-
-    sid = cookie.get("sid")
-    if not sid:
-        return None
-
-    session = SESSIONS.get(sid.value)
-    if not session:
-        return None
-
-    if now_ts() - session.get("created", 0) > SESSION_HOURS * 3600:
-        SESSIONS.pop(sid.value, None)
-        return None
-
-    users = load_users()
-    login = session.get("login")
-    user = users.get(login)
-    if not user:
-        return None
-
-    user = dict(user)
-    user["login"] = login
-    return user
-
-def create_session(handler, login):
-    sid = secrets.token_urlsafe(32)
-    SESSIONS[sid] = {"login": login, "created": now_ts()}
-    handler.send_header(
-        "Set-Cookie",
-        f"sid={sid}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_HOURS * 3600}"
-    )
-
-def clear_session(handler):
-    handler.send_header("Set-Cookie", "sid=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
-
-def read_form_urlencoded(handler):
-    length = int(handler.headers.get("Content-Length", "0"))
-    raw = handler.rfile.read(length).decode("utf-8", "ignore")
-    data = parse_qs(raw)
-    return {k: v[0] if v else "" for k, v in data.items()}
-
 CACHE_VALID_HOURS = int(os.environ.get("CACHE_VALID_HOURS", "36"))
 
 USERS_FILE = os.path.join(APP_DIR, "usuarios_sla.json") if os.name == "nt" else os.path.join(tempfile.gettempdir(), "usuarios_sla.json")
@@ -195,7 +77,7 @@ def load_users():
                 "nome": "Administrador",
                 "cliente_codigo": "",
                 "cliente_nome": "",
-                "trocar_senha": True,
+                "trocar_senha": False,
             }
         }
         save_users(users)
@@ -253,6 +135,13 @@ def create_session(handler, login):
 
 def clear_session(handler):
     handler.send_header("Set-Cookie", "sid=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
+
+
+def read_form_urlencoded(handler):
+    length = int(handler.headers.get("Content-Length", "0"))
+    raw = handler.rfile.read(length).decode("utf-8", "ignore")
+    data = parse_qs(raw)
+    return {k: v[0] if v else "" for k, v in data.items()}
 
 def normalize_cliente_codigo(v):
     s = norm_text(v)
@@ -927,6 +816,68 @@ def render_clientes_admin(rows, created_users=None):
         <div class='card'><h2>Relação de clientes</h2><div class='tablebox'><table><tr><th>Código Cliente</th><th>Nome Cliente</th><th>Login</th><th>Demandas</th></tr>{''.join(trs)}</table></div></div>
     </div></body></html>"""
 
+
+def render_usuarios_admin(msg=""):
+    users = load_users()
+    linhas = []
+    for login, u in sorted(users.items(), key=lambda x: (x[1].get("tipo", ""), x[0])):
+        tipo = u.get("tipo", "")
+        nome = u.get("nome", "")
+        cliente_codigo = u.get("cliente_codigo", "")
+        cliente_nome = u.get("cliente_nome", "")
+        trocar = "SIM" if u.get("trocar_senha") else "NÃO"
+        reset_form = f"""
+            <form method='post' action='/usuarios/resetar' class='inline_form'>
+                <input type='hidden' name='login_alvo' value='{html.escape(login)}'>
+                <input type='text' name='nova_senha' placeholder='Nova senha' minlength='6' required>
+                <button class='btn small' type='submit'>Resetar</button>
+            </form>
+        """
+        linhas.append(f"""
+        <tr>
+            <td>{html.escape(login)}</td>
+            <td>{html.escape(nome)}</td>
+            <td>{html.escape(tipo)}</td>
+            <td>{html.escape(cliente_codigo)}</td>
+            <td>{html.escape(cliente_nome)}</td>
+            <td>{trocar}</td>
+            <td>{reset_form}</td>
+        </tr>
+        """)
+
+    return f"""<!doctype html><html lang='pt-br'><head><meta charset='utf-8'><title>Usuários</title>{CSS}</head><body>
+    <div class='wrap wide'>
+        <div class='top'>
+            <div><h1>Gerenciar usuários</h1><p>Somente o administrador pode criar usuários e resetar senhas.</p></div>
+            <div class='actions'><a class='btn secondary' href='/dashboard'>Voltar</a><a class='btn secondary' href='/logout'>Sair</a></div>
+        </div>
+        {'<div class=okmsg>'+html.escape(msg)+'</div>' if msg else ''}
+
+        <div class='card'>
+            <h2>Criar novo usuário</h2>
+            <p class='sub'>Use tipo <b>funcionario</b> para Auxiliar, Assistente etc. Use tipo <b>cliente</b> para acesso filtrado pelo código cliente da coluna AF.</p>
+            <form method='post' action='/usuarios/criar' class='user_form'>
+                <div><label>Login</label><input type='text' name='novo_login' placeholder='ex: auxiliar01' required></div>
+                <div><label>Nome</label><input type='text' name='nome' placeholder='ex: Auxiliar Rastreamento' required></div>
+                <div><label>Tipo</label><select name='tipo' required><option value='funcionario'>funcionario</option><option value='cliente'>cliente</option><option value='admin'>admin</option></select></div>
+                <div><label>Senha inicial</label><input type='text' name='senha' minlength='6' placeholder='mínimo 6 caracteres' required></div>
+                <div><label>Código cliente AF</label><input type='text' name='cliente_codigo' placeholder='obrigatório se tipo cliente'></div>
+                <div><label>Nome cliente AG</label><input type='text' name='cliente_nome' placeholder='opcional'></div>
+                <button type='submit'>Criar usuário</button>
+            </form>
+        </div>
+
+        <div class='card'>
+            <h2>Usuários cadastrados</h2>
+            <div class='tablebox'>
+                <table>
+                    <tr><th>Login</th><th>Nome</th><th>Tipo</th><th>Cód. Cliente</th><th>Nome Cliente</th><th>Trocar senha</th><th>Resetar senha</th></tr>
+                    {''.join(linhas)}
+                </table>
+            </div>
+        </div>
+    </div></body></html>"""
+
 def render_upload(msg=""):
     return f"""<!doctype html><html lang='pt-br'><head><meta charset='utf-8'><title>Dashboard SLA SIN</title>{CSS}</head><body><div class='wrap'><div class='hero'><h1>Dashboard SLA SIN</h1><p>Área ADM: suba a planilha Excel uma vez ao dia. Clientes consultam apenas suas demandas.</p></div>{'<div class=err>'+html.escape(msg)+'</div>' if msg else ''}<form class='upload' method='post' enctype='multipart/form-data' action='/analisar'><input type='file' name='file' accept='.xlsx,.xlsm' required><button>Analisar planilha</button></form><div class='note'>Colunas usadas: Rastreamento C, I, K, R, S, Y, AB, AC, AD, AF código cliente, AG nome cliente e aba de feriados.</div></div></body></html>"""
 
@@ -974,7 +925,7 @@ def render_dashboard(rows, token, user=None):
     <div class='wrap wide'>
         <div class='top'>
             <div><h1>Dashboard SLA SIN</h1><p>Usuário: <b>{html.escape((user or {}).get('nome',''))}</b> | Perfil: <b>{html.escape((user or {}).get('tipo',''))}</b> | Base analisada em {datetime.now().strftime('%d/%m/%Y %H:%M')} | Total: <b>{s['total']}</b> | Consulta ativa por até {CACHE_VALID_HOURS}h</p></div>
-            <div class='actions'>{"<a class='btn' href='/'>Nova análise</a><a class='btn secondary' href='/clientes'>Clientes</a>" if (user or {}).get('tipo') == 'admin' else ""}<a class='btn secondary' href='/alterar_senha'>Senha</a><a class='btn secondary' href='/logout'>Sair</a></div>
+            <div class='actions'>{"<a class='btn' href='/'>Nova análise</a><a class='btn secondary' href='/clientes'>Clientes</a><a class='btn secondary' href='/usuarios'>Usuários</a>" if (user or {}).get('tipo') == 'admin' else ""}<a class='btn secondary' href='/alterar_senha'>Senha</a><a class='btn secondary' href='/logout'>Sair</a></div>
         </div>
 
         <section class='grid kpis'>
@@ -1208,9 +1159,19 @@ table{border-collapse:collapse;width:100%;font-size:13px}th,td{border-bottom:1px
 .login_form label{font-weight:700;color:#344b5a;font-size:13px}
 .login_form input{padding:13px 14px;border:1px solid #cbdce8;border-radius:12px;font-size:15px}
 .login_form button{margin-top:8px}
+
+.user_form{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;align-items:end}
+.user_form div{display:flex;flex-direction:column;gap:6px}
+.user_form label{font-weight:700;color:#344b5a;font-size:13px}
+.user_form input,.user_form select{padding:11px 12px;border:1px solid #cbdce8;border-radius:10px;font-size:14px}
+.inline_form{display:flex;gap:6px;align-items:center}
+.inline_form input{padding:7px 8px;border:1px solid #cbdce8;border-radius:8px}
+.okmsg{background:#e8fff1;color:#146c38;border:1px solid #b8efcb;padding:14px;border-radius:12px;margin-bottom:15px}
+
 @media(max-width:1200px){.home_layout{grid-template-columns:1fr}.charts_grid.clean{grid-template-columns:1fr 1fr}}
 @media(max-width:1000px){.kpis,.two,.menu_grid.compact,.charts_grid.clean{grid-template-columns:1fr}.upload,.top{display:block}.btn{margin-top:12px}.actions{display:block}.home_layout{grid-template-columns:1fr}}
 </style>"""
+
 
 
 class App(BaseHTTPRequestHandler):
@@ -1227,10 +1188,16 @@ class App(BaseHTTPRequestHandler):
         self.send_header("Location", location)
         self.end_headers()
 
+    def current_rows_and_token(self, user):
+        token = load_latest_token()
+        rows = load_cache(token) if token else None
+        if not rows:
+            return None, token
+        return filter_rows_for_user(rows, user), token
+
     def do_GET(self):
         parsed = urlparse(self.path)
 
-        # Páginas públicas
         if parsed.path == "/login":
             self.send_html(render_login())
             return
@@ -1242,49 +1209,80 @@ class App(BaseHTTPRequestHandler):
             self.end_headers()
             return
 
-        # A partir daqui, tudo exige login
         user = get_session_user(self)
         if not user:
             self.send_html(render_login("Faça login para acessar o sistema."), 401)
             return
 
-        # Página inicial: somente ADM pode ver upload
+        if user.get("trocar_senha") and parsed.path not in ("/alterar_senha",):
+            self.send_html(render_change_password(user, "Por segurança, altere sua senha inicial."))
+            return
+
+        if parsed.path == "/alterar_senha":
+            self.send_html(render_change_password(user))
+            return
+
         if parsed.path == "/":
             if user.get("tipo") != "admin":
-                self.send_html(render_login("Seu perfil não tem permissão para subir planilha."), 403)
+                self.redirect("/dashboard")
                 return
             self.send_html(render_upload())
             return
 
+        if parsed.path == "/usuarios":
+            if user.get("tipo") != "admin":
+                self.send_html(render_login("Acesso restrito ao administrador."), 403)
+                return
+            self.send_html(render_usuarios_admin())
+            return
+
+        if parsed.path == "/clientes":
+            if user.get("tipo") != "admin":
+                self.send_html(render_login("Acesso restrito ao administrador."), 403)
+                return
+            rows, token = self.current_rows_and_token(user)
+            if rows is None:
+                self.send_html(render_upload("Nenhuma análise carregada ainda. Suba a planilha."))
+                return
+            self.send_html(render_clientes_admin(rows))
+            return
+
         if parsed.path == "/dashboard":
             qs = parse_qs(parsed.query)
-            token = qs.get("token", [""])[0]
-            rows = CACHE.get(token)
+            token = qs.get("token", [""])[0] or load_latest_token()
+            rows = load_cache(token) if token else None
             if not rows:
-                self.send_html(render_upload("Analise expirada. Suba a planilha novamente."), 404)
+                if user.get("tipo") == "admin":
+                    self.send_html(render_upload("Análise não encontrada ou vencida. Suba a planilha novamente."), 404)
+                else:
+                    self.send_html(render_login("Nenhuma pesquisa disponível para seu cliente no momento."), 404)
                 return
-            self.send_html(render_dashboard(rows, token))
+            rows_user = filter_rows_for_user(rows, user)
+            self.send_html(render_dashboard(rows_user, token, user))
             return
 
         if parsed.path == "/pagina":
             qs = parse_qs(parsed.query)
-            token = qs.get("token", [""])[0]
+            token = qs.get("token", [""])[0] or load_latest_token()
             tipo = qs.get("tipo", ["prazo_rota"])[0]
-            rows = CACHE.get(token)
+            rows = load_cache(token) if token else None
             if not rows:
-                self.send_html(render_upload("Analise expirada. Suba a planilha novamente."), 404)
+                self.send_html(render_login("Análise não encontrada ou vencida."), 404)
                 return
-            self.send_html(render_detail_page(rows, token, tipo))
+            rows_user = filter_rows_for_user(rows, user)
+            self.send_html(render_detail_page(rows_user, token, tipo, user))
             return
 
         if parsed.path == "/download":
             qs = parse_qs(parsed.query)
-            token = qs.get("token", [""])[0]
+            token = qs.get("token", [""])[0] or load_latest_token()
             tipo = qs.get("tipo", ["todos"])[0]
-            rows = CACHE.get(token)
+            rows = load_cache(token) if token else None
             if not rows:
-                self.send_html(render_upload("Analise expirada. Suba a planilha novamente."), 404)
+                self.send_html(render_login("Análise não encontrada ou vencida."), 404)
                 return
+
+            rows = filter_rows_for_user(rows, user)
             filters = {
                 "aberto_atrasado": lambda r: r["status"] == "Em aberto com atraso",
                 "aberto_prazo": lambda r: r["status"] == "Em aberto no prazo",
@@ -1319,7 +1317,7 @@ class App(BaseHTTPRequestHandler):
 
             self.send_response(302)
             create_session(self, login)
-            self.send_header("Location", "/")
+            self.send_header("Location", "/dashboard" if u.get("tipo") != "admin" else "/")
             self.end_headers()
             return
 
@@ -1328,12 +1326,97 @@ class App(BaseHTTPRequestHandler):
             self.send_html(render_login("Faça login para acessar o sistema."), 401)
             return
 
+        if parsed.path == "/alterar_senha":
+            form = read_form_urlencoded(self)
+            senha_atual = form.get("senha_atual", "")
+            nova = form.get("nova_senha", "")
+            confirmar = form.get("confirmar_senha", "")
+
+            users = load_users()
+            stored = users.get(user["login"], {})
+            if not check_password(senha_atual, stored.get("senha_hash", "")):
+                self.send_html(render_change_password(user, "Senha atual incorreta."), 400)
+                return
+            if len(nova) < 6:
+                self.send_html(render_change_password(user, "A nova senha precisa ter pelo menos 6 caracteres."), 400)
+                return
+            if nova != confirmar:
+                self.send_html(render_change_password(user, "A confirmação não confere."), 400)
+                return
+
+            users[user["login"]]["senha_hash"] = hash_password(nova)
+            users[user["login"]]["trocar_senha"] = False
+            save_users(users)
+            self.redirect("/dashboard" if user.get("tipo") != "admin" else "/")
+            return
+
+        if parsed.path == "/usuarios/criar":
+            if user.get("tipo") != "admin":
+                self.send_html(render_login("Acesso restrito ao administrador."), 403)
+                return
+
+            form = read_form_urlencoded(self)
+            novo_login = norm_text(form.get("novo_login", ""))
+            nome = norm_text(form.get("nome", ""))
+            tipo = norm_text(form.get("tipo", "funcionario")).lower()
+            senha = form.get("senha", "")
+            cliente_codigo = normalize_cliente_codigo(form.get("cliente_codigo", ""))
+            cliente_nome = norm_text(form.get("cliente_nome", ""))
+
+            if not novo_login or len(senha) < 6:
+                self.send_html(render_usuarios_admin("Login e senha com mínimo de 6 caracteres são obrigatórios."), 400)
+                return
+            if tipo not in ("admin", "funcionario", "cliente"):
+                self.send_html(render_usuarios_admin("Tipo inválido."), 400)
+                return
+            if tipo == "cliente" and not cliente_codigo:
+                self.send_html(render_usuarios_admin("Para usuário cliente, o código cliente AF é obrigatório."), 400)
+                return
+
+            users = load_users()
+            if novo_login in users:
+                self.send_html(render_usuarios_admin("Esse login já existe."), 400)
+                return
+
+            users[novo_login] = {
+                "senha_hash": hash_password(senha),
+                "tipo": tipo,
+                "nome": nome or novo_login,
+                "cliente_codigo": cliente_codigo if tipo == "cliente" else "",
+                "cliente_nome": cliente_nome if tipo == "cliente" else "",
+                "trocar_senha": True,
+            }
+            save_users(users)
+            self.send_html(render_usuarios_admin(f"Usuário {novo_login} criado com sucesso."))
+            return
+
+        if parsed.path == "/usuarios/resetar":
+            if user.get("tipo") != "admin":
+                self.send_html(render_login("Acesso restrito ao administrador."), 403)
+                return
+
+            form = read_form_urlencoded(self)
+            login_alvo = norm_text(form.get("login_alvo", ""))
+            nova_senha = form.get("nova_senha", "")
+            users = load_users()
+
+            if login_alvo not in users:
+                self.send_html(render_usuarios_admin("Usuário não encontrado."), 404)
+                return
+            if len(nova_senha) < 6:
+                self.send_html(render_usuarios_admin("A nova senha precisa ter pelo menos 6 caracteres."), 400)
+                return
+
+            users[login_alvo]["senha_hash"] = hash_password(nova_senha)
+            users[login_alvo]["trocar_senha"] = True
+            save_users(users)
+            self.send_html(render_usuarios_admin(f"Senha do usuário {login_alvo} resetada com sucesso."))
+            return
+
         if parsed.path != "/analisar":
             self.send_html(render_login("Rota inválida."), 404)
             return
 
-        # BLOQUEIO PRINCIPAL:
-        # somente o administrador pode subir Excel.
         if user.get("tipo") != "admin":
             self.send_html(render_login("Acesso negado. Somente o administrador pode subir planilha Excel."), 403)
             return
@@ -1342,13 +1425,14 @@ class App(BaseHTTPRequestHandler):
             ctype = self.headers.get("Content-Type", "")
             m = re.search("boundary=(.*)", ctype)
             if not m:
-                raise ValueError("Upload invalido.")
+                raise ValueError("Upload inválido.")
             boundary = ("--" + m.group(1)).encode()
             length = int(self.headers.get("Content-Length", "0"))
             body = self.rfile.read(length)
             parts = body.split(boundary)
             file_bytes = None
             filename = "upload.xlsx"
+
             for part in parts:
                 if b'name="file"' in part and b'filename=' in part:
                     head, content = part.split(b"\r\n\r\n", 1)
@@ -1358,16 +1442,27 @@ class App(BaseHTTPRequestHandler):
                     if fm:
                         filename = fm.group(1).decode("utf-8", "ignore") or filename
                     break
+
             if not file_bytes:
                 raise ValueError("Nenhum arquivo recebido.")
+
             safe = re.sub(r"[^A-Za-z0-9_.-]", "_", filename)
             path = os.path.join(UPLOAD_DIR, f"{uuid.uuid4().hex}_{safe}")
             with open(path, "wb") as f:
                 f.write(file_bytes)
+
             rows, holidays = read_workbook(path)
             token = uuid.uuid4().hex
             CACHE[token] = rows
-            self.send_html(render_dashboard(rows, token))
+            save_cache(token, rows)
+            save_latest_token(token)
+
+            created = auto_create_client_users(rows)
+            if created:
+                self.send_html(render_clientes_admin(rows, created))
+            else:
+                self.send_html(render_dashboard(rows, token, user))
+
         except Exception as e:
             traceback.print_exc()
             self.send_html(render_upload("Erro ao analisar: " + str(e)), 500)
