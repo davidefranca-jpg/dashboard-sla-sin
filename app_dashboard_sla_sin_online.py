@@ -490,16 +490,39 @@ def pct(a, b):
 
 def make_summary(rows):
     total = len(rows)
+
     counts = {}
     for r in rows:
         counts[r["status"]] = counts.get(r["status"], 0) + 1
+
     finalizados = sum(1 for r in rows if r["finalizado"])
     em_aberto = total - finalizados
-    no_prazo_real = counts.get("Entregue antes do prazo", 0) + counts.get("Entregue no prazo", 0)
-    atrasado_real = counts.get("Entregue atrasado", 0) + counts.get("Entregue atrasado - Justificado", 0)
-    no_prazo_just = counts.get("Entregue antes do prazo", 0) + counts.get("Entregue no prazo", 0) + counts.get("Entregue atrasado - Justificado", 0)
-    atrasado_just = counts.get("Entregue atrasado", 0)
+
+    # ============================================================
+    # REGRA CORRETA DO SLA OPERACIONAL
+    # Base de cálculo: TOTAL filtrado da tela.
+    #
+    # SLA Real:
+    # (Entregue antes do prazo + Entregue no prazo + Em aberto no prazo) / Total
+    #
+    # SLA Justificado:
+    # (Entregue antes do prazo + Entregue no prazo + Em aberto no prazo + Justificado) / Total
+    # ============================================================
+    antes = counts.get("Entregue antes do prazo", 0)
+    no_prazo = counts.get("Entregue no prazo", 0)
+    aberto_prazo = counts.get("Em aberto no prazo", 0)
+    atrasado = counts.get("Entregue atrasado", 0)
+    atrasado_just = counts.get("Entregue atrasado - Justificado", 0)
+    aberto_atraso = counts.get("Em aberto com atraso", 0)
+
+    sla_real_ok_qtd = antes + no_prazo + aberto_prazo
+    sla_real_atraso_qtd = atrasado + atrasado_just + aberto_atraso
+
+    sla_just_ok_qtd = antes + no_prazo + aberto_prazo + atrasado_just
+    sla_just_atraso_qtd = atrasado + aberto_atraso
+
     falta_link = sum(1 for r in rows if r["falta_link"])
+
     return {
         "total": total,
         "finalizados": finalizados,
@@ -508,11 +531,165 @@ def make_summary(rows):
         "pct_em_aberto": pct(em_aberto, total),
         "counts": counts,
         "falta_link": falta_link,
-        "sla_real_ok": pct(no_prazo_real, max(1, no_prazo_real + atrasado_real)),
-        "sla_real_atrasado": pct(atrasado_real, max(1, no_prazo_real + atrasado_real)),
-        "sla_just_ok": pct(no_prazo_just, max(1, no_prazo_just + atrasado_just)),
-        "sla_just_atrasado": pct(atrasado_just, max(1, no_prazo_just + atrasado_just)),
+        "sla_real_ok": pct(sla_real_ok_qtd, total),
+        "sla_real_atrasado": pct(sla_real_atraso_qtd, total),
+        "sla_just_ok": pct(sla_just_ok_qtd, total),
+        "sla_just_atrasado": pct(sla_just_atraso_qtd, total),
     }
+
+
+def nivel_sla_label(valor):
+    """
+    Classificação operacional do SLA:
+    - ÓTIMO: 98% ou mais
+    - MÉDIO: de 95% até 97,99%
+    - PÉSSIMO / RISCO: abaixo de 95%
+    """
+    try:
+        valor = float(valor)
+    except Exception:
+        valor = 0.0
+    if valor >= 98:
+        return "ÓTIMO", "otimo"
+    if valor >= 95:
+        return "MÉDIO", "medio"
+    return "PÉSSIMO", "pessimo"
+
+def cliente_sla_ranking(rows):
+    """
+    Monta o SLA por cliente usando a mesma regra do painel:
+    SLA Real = antes + no prazo + em aberto no prazo / total
+    SLA Justificado = antes + no prazo + em aberto no prazo + justificado / total
+
+    O ranking é ordenado pelos piores clientes:
+    menor SLA justificado primeiro.
+    """
+    grupos = {}
+    for r in rows:
+        codigo = normalize_cliente_codigo(r.get("cliente_codigo", ""))
+        nome = norm_text(r.get("cliente_nome", ""))
+        chave = codigo or nome or "Sem código"
+        if chave not in grupos:
+            grupos[chave] = {"codigo": codigo or "Sem código", "nome": nome or "Cliente não informado", "rows": []}
+        if nome and grupos[chave]["nome"] == "Cliente não informado":
+            grupos[chave]["nome"] = nome
+        grupos[chave]["rows"].append(r)
+
+    ranking = []
+    for _, info in grupos.items():
+        resumo = make_summary(info["rows"])
+        nivel, classe = nivel_sla_label(resumo["sla_just_ok"])
+        ranking.append({
+            "codigo": info["codigo"],
+            "nome": info["nome"],
+            "total": resumo["total"],
+            "sla_real": resumo["sla_real_ok"],
+            "sla_just": resumo["sla_just_ok"],
+            "atrasado": resumo["sla_just_atrasado"],
+            "nivel": nivel,
+            "classe": classe,
+            "em_aberto_atraso": resumo["counts"].get("Em aberto com atraso", 0),
+            "entregue_atrasado": resumo["counts"].get("Entregue atrasado", 0),
+            "justificado": resumo["counts"].get("Entregue atrasado - Justificado", 0),
+        })
+
+    return sorted(ranking, key=lambda x: (x["sla_just"], -x["total"], x["nome"]))
+
+def render_cliente_sla_top(rows, token="", cliente_filtro=""):
+    ranking = cliente_sla_ranking(rows)
+    if not ranking:
+        return ""
+
+    qtd_otimo = sum(1 for x in ranking if x["classe"] == "otimo")
+    qtd_medio = sum(1 for x in ranking if x["classe"] == "medio")
+    qtd_pessimo = sum(1 for x in ranking if x["classe"] == "pessimo")
+    pior = ranking[0]
+
+    if cliente_filtro and len(ranking) == 1:
+        itens = ranking
+        titulo = "SLA do cliente selecionado"
+        subtitulo = "Classificação automática: ÓTIMO acima de 98%, MÉDIO entre 95% e 98%, PÉSSIMO abaixo de 95%."
+    else:
+        itens = ranking[:10]
+        titulo = "SLA por cliente automático"
+        subtitulo = "Ranking dos piores clientes por SLA justificado. Abaixo de 95% entra em risco crítico."
+
+    alerta_html = ""
+    if pior["sla_just"] < 95:
+        alerta_html = f"""
+        <div class='sla_alerta sla_alerta_ruim'>
+            <b>ALERTA DE RISCO SLA:</b>
+            pior cliente abaixo de 95% — {html.escape(pior['codigo'])} - {html.escape(pior['nome'])}
+            com SLA justificado de <b>{pior['sla_just']:.2f}%</b>.
+        </div>
+        """
+    elif pior["sla_just"] < 98:
+        alerta_html = f"""
+        <div class='sla_alerta sla_alerta_medio'>
+            <b>ATENÇÃO:</b>
+            existe cliente na faixa média — {html.escape(pior['codigo'])} - {html.escape(pior['nome'])}
+            com SLA justificado de <b>{pior['sla_just']:.2f}%</b>.
+        </div>
+        """
+    else:
+        alerta_html = """
+        <div class='sla_alerta sla_alerta_otimo'>
+            <b>SLA saudável:</b> todos os clientes estão com SLA justificado acima de 98%.
+        </div>
+        """
+
+    linhas = []
+    for pos, item in enumerate(itens, start=1):
+        linhas.append(f"""
+        <tr>
+            <td>{pos}</td>
+            <td>{html.escape(item['codigo'])}</td>
+            <td>{html.escape(item['nome'])}</td>
+            <td>{item['total']}</td>
+            <td>{item['sla_real']:.2f}%</td>
+            <td>{item['sla_just']:.2f}%</td>
+            <td>{item['atrasado']:.2f}%</td>
+            <td><span class='sla_badge {item['classe']}'>{html.escape(item['nivel'])}</span></td>
+            <td>{item['em_aberto_atraso']}</td>
+            <td>{item['entregue_atrasado']}</td>
+            <td>{item['justificado']}</td>
+        </tr>
+        """)
+
+    return f"""
+    <section class='card cliente_sla_top'>
+        <div class='cliente_sla_head'>
+            <div>
+                <h2>{html.escape(titulo)}</h2>
+                <p class='sub'>{html.escape(subtitulo)}</p>
+            </div>
+            <div class='cliente_sla_resumo'>
+                <span class='pill otimo'>Ótimo: {qtd_otimo}</span>
+                <span class='pill medio'>Médio: {qtd_medio}</span>
+                <span class='pill pessimo'>Péssimo: {qtd_pessimo}</span>
+            </div>
+        </div>
+        {alerta_html}
+        <div class='tablebox cliente_sla_scroll'>
+            <table>
+                <tr>
+                    <th>#</th>
+                    <th>Cód. Cliente</th>
+                    <th>Cliente</th>
+                    <th>Total</th>
+                    <th>SLA Real</th>
+                    <th>SLA Justificado</th>
+                    <th>Atrasado</th>
+                    <th>Nível</th>
+                    <th>Aberto atraso</th>
+                    <th>Entregue atraso</th>
+                    <th>Justificado</th>
+                </tr>
+                {''.join(linhas)}
+            </table>
+        </div>
+    </section>
+    """
 
 def csv_bytes(rows):
     out = io.StringIO()
@@ -741,8 +918,16 @@ def route_chart_items(rows, top_n=7):
 def render_charts(rows):
     s = make_summary(rows)
     status_items = sorted(s['counts'].items(), key=lambda x: x[1], reverse=True)
-    no_prazo_just = s['counts'].get('Entregue antes do prazo', 0) + s['counts'].get('Entregue no prazo', 0) + s['counts'].get('Entregue atrasado - Justificado', 0)
-    atrasado_just = s['counts'].get('Entregue atrasado', 0)
+
+    # Gráfico alinhado com a mesma regra do painel:
+    # SLA Justificado = antes + no prazo + em aberto no prazo + justificado, dividido pelo total.
+    no_prazo_just = (
+        s['counts'].get('Entregue antes do prazo', 0)
+        + s['counts'].get('Entregue no prazo', 0)
+        + s['counts'].get('Em aberto no prazo', 0)
+        + s['counts'].get('Entregue atrasado - Justificado', 0)
+    )
+    atrasado_just = s['counts'].get('Entregue atrasado', 0) + s['counts'].get('Em aberto com atraso', 0)
     rotas = route_chart_items(rows, top_n=7)
     total_rotas = sum(v for _, v in rotas)
     return f"""
@@ -955,7 +1140,9 @@ def render_dashboard(rows, token, user=None, all_rows=None, cliente_filtro=''):
         for k, v in sorted(s["counts"].items(), key=lambda x: x[1], reverse=True)
     ])
 
+    qtd_clientes_risco = sum(1 for item in cliente_sla_ranking(rows) if item["classe"] == "pessimo")
     botoes = "".join([
+        resumo_card("Ranking SLA por Cliente", qtd_clientes_risco, "Clientes abaixo de 95%", page_link(token, "ranking_clientes", cliente_filtro), "red"),
         resumo_card("SLA Geral por Origem", s["total"], "Analisar rotas UF", page_link(token, "prazo_rota", cliente_filtro), "green"),
         resumo_card("Prazo completo por Filial", s["total"], "Analisar filiais", page_link(token, "prazo_filial", cliente_filtro), "blue"),
         resumo_card("Entregas atrasadas por Origem x Destino UF", len(atrasados), "Analisar atraso por rota", page_link(token, "atraso_rota", cliente_filtro), "orange"),
@@ -998,6 +1185,7 @@ def render_dashboard(rows, token, user=None, all_rows=None, cliente_filtro=''):
             <div class='actions'>{"<a class='btn' href='/'>Nova análise</a><a class='btn secondary' href='/clientes'>Clientes</a><a class='btn secondary' href='/usuarios'>Usuários</a>" if (user or {}).get('tipo') == 'admin' else ""}<a class='btn secondary' href='/alterar_senha'>Senha</a><a class='btn secondary' href='/logout'>Sair</a></div>
         </div>
         {filtro_cliente_html}
+        {render_cliente_sla_top(rows, token, cliente_filtro)}
 
         <section class='grid kpis'>
             <div class='kpi green'><b>{s['pct_finalizados']:.2f}%</b><span>Finalizados</span><small>{s['finalizados']} pedidos</small></div>
@@ -1034,6 +1222,7 @@ def render_detail_page(rows, token, kind, user=None, cliente_filtro=''):
     devolucao = [r for r in rows if r['operacao_grupo'] == 'Devolucao/Reversa']
 
     config = {
+        "ranking_clientes": ("Ranking SLA por Cliente", render_cliente_sla_top(rows, token, cliente_filtro), None),
         "prazo_rota": ("SLA Geral por Origem", sla_geral_origem_table('SLA Geral por Origem', rows, max(1, len(rows)), group_key='rota_uf', group_label='Origem x Destino UF'), None),
         "prazo_filial": ("Prazo completo por Filial", sla_geral_origem_table('Prazo completo por Filial', rows, max(1, len(rows)), group_key='filial', group_label='Filial'), None),
         "atraso_rota": ("Entregas atrasadas por Origem x Destino UF", bar_table('Entregas atrasadas por Origem x Destino UF', group_count(atrasados, 'rota_uf'), max(1, len(atrasados))), None),
@@ -1245,6 +1434,23 @@ table{border-collapse:collapse;width:100%;font-size:13px}th,td{border-bottom:1px
 .filtro_cliente_form h2{margin-bottom:4px}
 .filtro_cliente_form select{padding:12px 14px;border:1px solid #cbdce8;border-radius:12px;font-size:14px;background:white;min-width:260px}
 .filtro_atual{margin-top:10px;color:#516879;font-size:14px}
+
+.cliente_sla_top{margin-bottom:14px;border:2px solid #d6e8f3}
+.cliente_sla_head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;margin-bottom:12px}
+.cliente_sla_resumo{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+.pill{display:inline-block;padding:8px 12px;border-radius:999px;font-size:12px;font-weight:800}
+.pill.otimo{background:#e8fff1;color:#087337;border:1px solid #b8efcb}
+.pill.medio{background:#fff8e3;color:#8a5b00;border:1px solid #ffe49a}
+.pill.pessimo{background:#ffe8e8;color:#9b1c1c;border:1px solid #ffc4c4}
+.sla_alerta{padding:13px 15px;border-radius:12px;margin:10px 0 14px;font-size:14px}
+.sla_alerta_ruim{background:#ffe8e8;color:#8d1f1f;border:1px solid #ffc4c4}
+.sla_alerta_medio{background:#fff8e3;color:#8a5b00;border:1px solid #ffe49a}
+.sla_alerta_otimo{background:#e8fff1;color:#146c38;border:1px solid #b8efcb}
+.sla_badge{display:inline-block;padding:6px 10px;border-radius:999px;font-size:11px;font-weight:900}
+.sla_badge.otimo{background:#00a957;color:white}
+.sla_badge.medio{background:#f0b429;color:#17212b}
+.sla_badge.pessimo{background:#c94343;color:white}
+.cliente_sla_scroll{max-height:330px}
 
 @media(max-width:1200px){.home_layout{grid-template-columns:1fr}.charts_grid.clean{grid-template-columns:1fr 1fr}}
 @media(max-width:1000px){.filtro_cliente_form{grid-template-columns:1fr}.filtro_cliente_form select{min-width:0;width:100%}.kpis,.two,.menu_grid.compact,.charts_grid.clean{grid-template-columns:1fr}.upload,.top{display:block}.btn{margin-top:12px}.actions{display:block}.home_layout{grid-template-columns:1fr}}
