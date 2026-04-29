@@ -879,29 +879,6 @@ def render_usuarios_admin(msg=""):
     </div></body></html>"""
 
 def render_upload(msg=""):
-    filtro_cliente_html = ""
-    if (user or {}).get("tipo") == "admin":
-        filtro_titulo = "Todos os clientes"
-        if cliente_filtro:
-            filtro_titulo = f"{cliente_filtro} - {cliente_nome_filtro}" if cliente_nome_filtro else cliente_filtro
-        filtro_cliente_html = f"""
-        <section class='card filtro_cliente_card'>
-            <form method='get' action='/dashboard' class='filtro_cliente_form'>
-                <div>
-                    <h2>Filtro por cliente</h2>
-                    <p class='sub'>Selecione um cliente para a tela inteira mostrar apenas os dados dele. Deixe em branco para voltar ao geral.</p>
-                </div>
-                <select name='cliente'>
-                    {clientes_options_from_rows(all_rows, cliente_filtro)}
-                </select>
-                <button type='submit'>Aplicar filtro</button>
-                <a class='btn secondary' href='/dashboard'>Limpar</a>
-            </form>
-            <div class='filtro_atual'>Visualizando: <b>{html.escape(filtro_titulo)}</b> | Total filtrado: <b>{s['total']}</b></div>
-        </section>
-        """
-
-
     return f"""<!doctype html><html lang='pt-br'><head><meta charset='utf-8'><title>Dashboard SLA SIN</title>{CSS}</head><body><div class='wrap'><div class='hero'><h1>Dashboard SLA SIN</h1><p>Área ADM: suba a planilha Excel uma vez ao dia. Clientes consultam apenas suas demandas.</p></div>{'<div class=err>'+html.escape(msg)+'</div>' if msg else ''}<form class='upload' method='post' enctype='multipart/form-data' action='/analisar'><input type='file' name='file' accept='.xlsx,.xlsm' required><button>Analisar planilha</button></form><div class='note'>Colunas usadas: Rastreamento C, I, K, R, S, Y, AB, AC, AD, AF código cliente, AG nome cliente e aba de feriados.</div></div></body></html>"""
 
 
@@ -1282,6 +1259,10 @@ class App(BaseHTTPRequestHandler):
         if not rows:
             return None, token
         return filter_rows_for_user(rows, user), token
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.end_headers()
 
     def do_GET(self):
         parsed = urlparse(self.path)
