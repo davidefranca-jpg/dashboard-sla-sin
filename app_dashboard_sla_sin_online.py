@@ -879,10 +879,59 @@ def render_usuarios_admin(msg=""):
     </div></body></html>"""
 
 def render_upload(msg=""):
+    filtro_cliente_html = ""
+    if (user or {}).get("tipo") == "admin":
+        filtro_titulo = "Todos os clientes"
+        if cliente_filtro:
+            filtro_titulo = f"{cliente_filtro} - {cliente_nome_filtro}" if cliente_nome_filtro else cliente_filtro
+        filtro_cliente_html = f"""
+        <section class='card filtro_cliente_card'>
+            <form method='get' action='/dashboard' class='filtro_cliente_form'>
+                <div>
+                    <h2>Filtro por cliente</h2>
+                    <p class='sub'>Selecione um cliente para a tela inteira mostrar apenas os dados dele. Deixe em branco para voltar ao geral.</p>
+                </div>
+                <select name='cliente'>
+                    {clientes_options_from_rows(all_rows, cliente_filtro)}
+                </select>
+                <button type='submit'>Aplicar filtro</button>
+                <a class='btn secondary' href='/dashboard'>Limpar</a>
+            </form>
+            <div class='filtro_atual'>Visualizando: <b>{html.escape(filtro_titulo)}</b> | Total filtrado: <b>{s['total']}</b></div>
+        </section>
+        """
+
+
     return f"""<!doctype html><html lang='pt-br'><head><meta charset='utf-8'><title>Dashboard SLA SIN</title>{CSS}</head><body><div class='wrap'><div class='hero'><h1>Dashboard SLA SIN</h1><p>Área ADM: suba a planilha Excel uma vez ao dia. Clientes consultam apenas suas demandas.</p></div>{'<div class=err>'+html.escape(msg)+'</div>' if msg else ''}<form class='upload' method='post' enctype='multipart/form-data' action='/analisar'><input type='file' name='file' accept='.xlsx,.xlsm' required><button>Analisar planilha</button></form><div class='note'>Colunas usadas: Rastreamento C, I, K, R, S, Y, AB, AC, AD, AF código cliente, AG nome cliente e aba de feriados.</div></div></body></html>"""
 
-def page_link(token, kind):
-    return f"/pagina?token={token}&tipo={kind}"
+
+def clientes_options_from_rows(rows, selected_codigo=""):
+    clientes = {}
+    for r in rows:
+        codigo = normalize_cliente_codigo(r.get("cliente_codigo", ""))
+        nome = norm_text(r.get("cliente_nome", ""))
+        if codigo and codigo not in clientes:
+            clientes[codigo] = nome
+    opts = ["<option value=''>Todos os clientes</option>"]
+    for codigo, nome in sorted(clientes.items(), key=lambda x: (x[1] or x[0])):
+        sel = " selected" if normalize_cliente_codigo(selected_codigo) == codigo else ""
+        label = f"{codigo} - {nome}" if nome else codigo
+        opts.append(f"<option value='{html.escape(codigo)}'{sel}>{html.escape(label)}</option>")
+    return "".join(opts)
+
+def filtrar_por_cliente_admin(rows, cliente_codigo):
+    codigo = normalize_cliente_codigo(cliente_codigo)
+    if not codigo:
+        return rows
+    return [r for r in rows if normalize_cliente_codigo(r.get("cliente_codigo", "")) == codigo]
+
+def cliente_query_param(cliente_codigo):
+    codigo = normalize_cliente_codigo(cliente_codigo)
+    return f"&cliente={html.escape(codigo)}" if codigo else ""
+
+
+def page_link(token, kind, cliente_codigo=""):
+    return f"/pagina?token={token}&tipo={kind}{cliente_query_param(cliente_codigo)}"
 
 def resumo_card(title, value, subtitle, href, css_class="blue"):
     return f"""
@@ -893,8 +942,16 @@ def resumo_card(title, value, subtitle, href, css_class="blue"):
     </a>
     """
 
-def render_dashboard(rows, token, user=None):
+def render_dashboard(rows, token, user=None, all_rows=None, cliente_filtro=''):
     s = make_summary(rows)
+    all_rows = all_rows or rows
+    cliente_filtro = normalize_cliente_codigo(cliente_filtro)
+    cliente_nome_filtro = ""
+    if cliente_filtro:
+        for rr in all_rows:
+            if normalize_cliente_codigo(rr.get("cliente_codigo", "")) == cliente_filtro:
+                cliente_nome_filtro = rr.get("cliente_nome", "")
+                break
     total = max(1, s["total"])
     atrasados = [r for r in rows if r["status"] in ("Entregue atrasado", "Entregue atrasado - Justificado")]
     aberto_atraso = [r for r in rows if r["status"] == "Em aberto com atraso"]
@@ -909,17 +966,40 @@ def render_dashboard(rows, token, user=None):
     ])
 
     botoes = "".join([
-        resumo_card("SLA Geral por Origem", s["total"], "Analisar rotas UF", page_link(token, "prazo_rota"), "green"),
-        resumo_card("Prazo completo por Filial", s["total"], "Analisar filiais", page_link(token, "prazo_filial"), "blue"),
-        resumo_card("Entregas atrasadas por Origem x Destino UF", len(atrasados), "Analisar atraso por rota", page_link(token, "atraso_rota"), "orange"),
-        resumo_card("Entregas atrasadas por Filial", len(atrasados), "Analisar atraso por filial", page_link(token, "atraso_filial"), "red"),
-        resumo_card("Devolução/Reversa por Filial", len(devolucao), "Analisar reversas", page_link(token, "devolucao_filial"), "purple"),
-        resumo_card("Relação de atraso por BASE", len(aberto_atraso), "Em aberto atrasado", page_link(token, "parceiros_atrasado"), "red"),
-        resumo_card("Pedidos em aberto atrasados", len(aberto_atraso), "Lista detalhada", page_link(token, "aberto_atrasado"), "orange"),
-        resumo_card("Pedidos em aberto no prazo", len(aberto_prazo), "Lista detalhada", page_link(token, "aberto_prazo"), "green"),
-        resumo_card("Prazo atrasado justificado", len(justificados), "Lista detalhada", page_link(token, "justificados"), "purple"),
-        resumo_card("Falta link de comprovante", len(falta_link), "Lista detalhada", page_link(token, "falta_link"), "red"),
+        resumo_card("SLA Geral por Origem", s["total"], "Analisar rotas UF", page_link(token, "prazo_rota", cliente_filtro), "green"),
+        resumo_card("Prazo completo por Filial", s["total"], "Analisar filiais", page_link(token, "prazo_filial", cliente_filtro), "blue"),
+        resumo_card("Entregas atrasadas por Origem x Destino UF", len(atrasados), "Analisar atraso por rota", page_link(token, "atraso_rota", cliente_filtro), "orange"),
+        resumo_card("Entregas atrasadas por Filial", len(atrasados), "Analisar atraso por filial", page_link(token, "atraso_filial", cliente_filtro), "red"),
+        resumo_card("Devolução/Reversa por Filial", len(devolucao), "Analisar reversas", page_link(token, "devolucao_filial", cliente_filtro), "purple"),
+        resumo_card("Relação de atraso por BASE", len(aberto_atraso), "Em aberto atrasado", page_link(token, "parceiros_atrasado", cliente_filtro), "red"),
+        resumo_card("Pedidos em aberto atrasados", len(aberto_atraso), "Lista detalhada", page_link(token, "aberto_atrasado", cliente_filtro), "orange"),
+        resumo_card("Pedidos em aberto no prazo", len(aberto_prazo), "Lista detalhada", page_link(token, "aberto_prazo", cliente_filtro), "green"),
+        resumo_card("Prazo atrasado justificado", len(justificados), "Lista detalhada", page_link(token, "justificados", cliente_filtro), "purple"),
+        resumo_card("Falta link de comprovante", len(falta_link), "Lista detalhada", page_link(token, "falta_link", cliente_filtro), "red"),
     ])
+
+    filtro_cliente_html = ""
+    if (user or {}).get("tipo") == "admin":
+        filtro_titulo = "Todos os clientes"
+        if cliente_filtro:
+            filtro_titulo = f"{cliente_filtro} - {cliente_nome_filtro}" if cliente_nome_filtro else cliente_filtro
+        filtro_cliente_html = f"""
+        <section class='card filtro_cliente_card'>
+            <form method='get' action='/dashboard' class='filtro_cliente_form'>
+                <div>
+                    <h2>Filtro por cliente</h2>
+                    <p class='sub'>Selecione um cliente para a tela inteira mostrar apenas os dados dele. Deixe em branco para voltar ao geral.</p>
+                </div>
+                <select name='cliente'>
+                    {clientes_options_from_rows(all_rows, cliente_filtro)}
+                </select>
+                <button type='submit'>Aplicar filtro</button>
+                <a class='btn secondary' href='/dashboard'>Limpar</a>
+            </form>
+            <div class='filtro_atual'>Visualizando: <b>{html.escape(filtro_titulo)}</b> | Total filtrado: <b>{s['total']}</b></div>
+        </section>
+        """
+
 
     return f"""<!doctype html><html lang='pt-br'><head><meta charset='utf-8'><title>Dashboard SLA SIN</title>{CSS}</head><body>
     <div class='wrap wide'>
@@ -927,6 +1007,7 @@ def render_dashboard(rows, token, user=None):
             <div><h1>Dashboard SLA SIN</h1><p>Usuário: <b>{html.escape((user or {}).get('nome',''))}</b> | Perfil: <b>{html.escape((user or {}).get('tipo',''))}</b> | Base analisada em {datetime.now().strftime('%d/%m/%Y %H:%M')} | Total: <b>{s['total']}</b> | Consulta ativa por até {CACHE_VALID_HOURS}h</p></div>
             <div class='actions'>{"<a class='btn' href='/'>Nova análise</a><a class='btn secondary' href='/clientes'>Clientes</a><a class='btn secondary' href='/usuarios'>Usuários</a>" if (user or {}).get('tipo') == 'admin' else ""}<a class='btn secondary' href='/alterar_senha'>Senha</a><a class='btn secondary' href='/logout'>Sair</a></div>
         </div>
+        {filtro_cliente_html}
 
         <section class='grid kpis'>
             <div class='kpi green'><b>{s['pct_finalizados']:.2f}%</b><span>Finalizados</span><small>{s['finalizados']} pedidos</small></div>
@@ -954,7 +1035,7 @@ def render_dashboard(rows, token, user=None):
         </section>
     </div></body></html>"""
 
-def render_detail_page(rows, token, kind, user=None):
+def render_detail_page(rows, token, kind, user=None, cliente_filtro=''):
     atrasados = [r for r in rows if r["status"] in ("Entregue atrasado", "Entregue atrasado - Justificado")]
     aberto_atraso = sorted([r for r in rows if r["status"] == "Em aberto com atraso"], key=lambda r: r["dias_atraso"], reverse=True)
     aberto_prazo = sorted([r for r in rows if r["status"] == "Em aberto no prazo"], key=lambda r: r["data_prevista"] or date.max)
@@ -977,13 +1058,13 @@ def render_detail_page(rows, token, kind, user=None):
             ),
             None
         ),
-        "aberto_atrasado": ("Pedidos em aberto atrasados", section_table('Pedidos em aberto atrasados', aberto_atraso, token, 'aberto_atrasado'), 'aberto_atrasado'),
-        "aberto_prazo": ("Pedidos em aberto no prazo", section_table('Pedidos em aberto no prazo', aberto_prazo, token, 'aberto_prazo'), 'aberto_prazo'),
-        "justificados": ("Prazo de entrega atrasado justificado", section_table('Prazo de entrega atrasado justificado', justificados, token, 'justificados'), 'justificados'),
-        "falta_link": ("Falta link de comprovante", section_table('Falta link de comprovante', falta_link, token, 'falta_link'), 'falta_link'),
+        "aberto_atrasado": ("Pedidos em aberto atrasados", section_table('Pedidos em aberto atrasados', aberto_atraso, token, 'aberto_atrasado', cliente_filtro), 'aberto_atrasado'),
+        "aberto_prazo": ("Pedidos em aberto no prazo", section_table('Pedidos em aberto no prazo', aberto_prazo, token, 'aberto_prazo', cliente_filtro), 'aberto_prazo'),
+        "justificados": ("Prazo de entrega atrasado justificado", section_table('Prazo de entrega atrasado justificado', justificados, token, 'justificados', cliente_filtro), 'justificados'),
+        "falta_link": ("Falta link de comprovante", section_table('Falta link de comprovante', falta_link, token, 'falta_link', cliente_filtro), 'falta_link'),
     }
     title, content, download_kind = config.get(kind, config["prazo_rota"])
-    download = f"<a class='btn' href='/download?token={token}&tipo={download_kind}'>Baixar CSV</a>" if download_kind else ""
+    download = f"<a class='btn' href='/download?token={token}&tipo={download_kind}{cliente_query_param(cliente_filtro)}'>Baixar CSV</a>" if download_kind else ""
     return f"""<!doctype html><html lang='pt-br'><head><meta charset='utf-8'><title>{html.escape(title)}</title>{CSS}</head><body>
     <div class='wrap wide'>
         <div class='top'>
@@ -993,8 +1074,8 @@ def render_detail_page(rows, token, kind, user=None):
         {content}
     </div></body></html>"""
 
-def section_table(title, rows, token, kind):
-    return f"<section class='card'><div class='section_head'><h2>{html.escape(title)} <small>({len(rows)})</small></h2><a class='btn small' href='/download?token={token}&tipo={kind}'>Baixar CSV</a></div><div class='tablebox'><table><tr><th>NF</th><th>Status</th><th>Data inicial</th><th>Data prevista</th><th>Data entrega</th><th>Dias atraso</th><th>Parceiro</th><th>Filial</th><th>Tipo</th><th>UF Origem</th><th>UF Destino</th><th>Falta link</th></tr>{table_rows(rows)}</table></div></section>"
+def section_table(title, rows, token, kind, cliente_filtro=""):
+    return f"<section class='card'><div class='section_head'><h2>{html.escape(title)} <small>({len(rows)})</small></h2><a class='btn small' href='/download?token={token}&tipo={kind}{cliente_query_param(cliente_filtro)}'>Baixar CSV</a></div><div class='tablebox'><table><tr><th>NF</th><th>Status</th><th>Data inicial</th><th>Data prevista</th><th>Data entrega</th><th>Dias atraso</th><th>Parceiro</th><th>Filial</th><th>Tipo</th><th>UF Origem</th><th>UF Destino</th><th>Falta link</th></tr>{table_rows(rows)}</table></div></section>"
 
 CSS = """<style>
 *{box-sizing:border-box}
@@ -1168,8 +1249,15 @@ table{border-collapse:collapse;width:100%;font-size:13px}th,td{border-bottom:1px
 .inline_form input{padding:7px 8px;border:1px solid #cbdce8;border-radius:8px}
 .okmsg{background:#e8fff1;color:#146c38;border:1px solid #b8efcb;padding:14px;border-radius:12px;margin-bottom:15px}
 
+
+.filtro_cliente_card{margin-bottom:14px;padding:18px}
+.filtro_cliente_form{display:grid;grid-template-columns:1fr 360px auto auto;gap:12px;align-items:end}
+.filtro_cliente_form h2{margin-bottom:4px}
+.filtro_cliente_form select{padding:12px 14px;border:1px solid #cbdce8;border-radius:12px;font-size:14px;background:white;min-width:260px}
+.filtro_atual{margin-top:10px;color:#516879;font-size:14px}
+
 @media(max-width:1200px){.home_layout{grid-template-columns:1fr}.charts_grid.clean{grid-template-columns:1fr 1fr}}
-@media(max-width:1000px){.kpis,.two,.menu_grid.compact,.charts_grid.clean{grid-template-columns:1fr}.upload,.top{display:block}.btn{margin-top:12px}.actions{display:block}.home_layout{grid-template-columns:1fr}}
+@media(max-width:1000px){.filtro_cliente_form{grid-template-columns:1fr}.filtro_cliente_form select{min-width:0;width:100%}.kpis,.two,.menu_grid.compact,.charts_grid.clean{grid-template-columns:1fr}.upload,.top{display:block}.btn{margin-top:12px}.actions{display:block}.home_layout{grid-template-columns:1fr}}
 </style>"""
 
 
@@ -1257,8 +1345,12 @@ class App(BaseHTTPRequestHandler):
                 else:
                     self.send_html(render_login("Nenhuma pesquisa disponível para seu cliente no momento."), 404)
                 return
-            rows_user = filter_rows_for_user(rows, user)
-            self.send_html(render_dashboard(rows_user, token, user))
+            cliente_filtro = qs.get("cliente", [""])[0] if user.get("tipo") == "admin" else ""
+            if user.get("tipo") == "admin" and cliente_filtro:
+                rows_user = filtrar_por_cliente_admin(rows, cliente_filtro)
+            else:
+                rows_user = filter_rows_for_user(rows, user)
+            self.send_html(render_dashboard(rows_user, token, user, all_rows=rows, cliente_filtro=cliente_filtro))
             return
 
         if parsed.path == "/pagina":
@@ -1269,8 +1361,12 @@ class App(BaseHTTPRequestHandler):
             if not rows:
                 self.send_html(render_login("Análise não encontrada ou vencida."), 404)
                 return
-            rows_user = filter_rows_for_user(rows, user)
-            self.send_html(render_detail_page(rows_user, token, tipo, user))
+            cliente_filtro = qs.get("cliente", [""])[0] if user.get("tipo") == "admin" else ""
+            if user.get("tipo") == "admin" and cliente_filtro:
+                rows_user = filtrar_por_cliente_admin(rows, cliente_filtro)
+            else:
+                rows_user = filter_rows_for_user(rows, user)
+            self.send_html(render_detail_page(rows_user, token, tipo, user, cliente_filtro))
             return
 
         if parsed.path == "/download":
@@ -1282,7 +1378,11 @@ class App(BaseHTTPRequestHandler):
                 self.send_html(render_login("Análise não encontrada ou vencida."), 404)
                 return
 
-            rows = filter_rows_for_user(rows, user)
+            cliente_filtro = qs.get("cliente", [""])[0] if user.get("tipo") == "admin" else ""
+            if user.get("tipo") == "admin" and cliente_filtro:
+                rows = filtrar_por_cliente_admin(rows, cliente_filtro)
+            else:
+                rows = filter_rows_for_user(rows, user)
             filters = {
                 "aberto_atrasado": lambda r: r["status"] == "Em aberto com atraso",
                 "aberto_prazo": lambda r: r["status"] == "Em aberto no prazo",
@@ -1461,7 +1561,7 @@ class App(BaseHTTPRequestHandler):
             if created:
                 self.send_html(render_clientes_admin(rows, created))
             else:
-                self.send_html(render_dashboard(rows, token, user))
+                self.send_html(render_dashboard(rows, token, user, all_rows=rows))
 
         except Exception as e:
             traceback.print_exc()
