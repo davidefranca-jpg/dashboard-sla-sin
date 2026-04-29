@@ -209,8 +209,15 @@ def load_latest_token():
 def filter_rows_for_user(rows, user):
     if not user:
         return []
-    if user.get("tipo") == "admin":
+
+    # CORREÇÃO DE ACESSO:
+    # Admin e funcionário devem visualizar a base completa.
+    # Antes apenas admin via tudo; funcionário caía na regra de cliente,
+    # e como não possui cliente_codigo, a tela ficava zerada.
+    if user.get("tipo") in ("admin", "funcionario"):
         return rows
+
+    # Cliente visualiza apenas as linhas vinculadas ao código cliente da coluna AF.
     codigo = normalize_cliente_codigo(user.get("cliente_codigo", ""))
     return [r for r in rows if normalize_cliente_codigo(r.get("cliente_codigo", "")) == codigo]
 
