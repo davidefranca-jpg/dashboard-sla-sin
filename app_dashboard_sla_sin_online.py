@@ -878,8 +878,21 @@ def render_usuarios_admin(msg=""):
         </div>
     </div></body></html>"""
 
-def render_upload(msg=""):
-    return f"""<!doctype html><html lang='pt-br'><head><meta charset='utf-8'><title>Dashboard SLA SIN</title>{CSS}</head><body><div class='wrap'><div class='hero'><h1>Dashboard SLA SIN</h1><p>Área ADM: suba a planilha Excel uma vez ao dia. Clientes consultam apenas suas demandas.</p></div>{'<div class=err>'+html.escape(msg)+'</div>' if msg else ''}<form class='upload' method='post' enctype='multipart/form-data' action='/analisar'><input type='file' name='file' accept='.xlsx,.xlsm' required><button>Analisar planilha</button></form><div class='note'>Colunas usadas: Rastreamento C, I, K, R, S, Y, AB, AC, AD, AF código cliente, AG nome cliente e aba de feriados.</div></div></body></html>"""
+def render_upload(user=None, msg=""):
+    """
+    Tela de upload da área ADM.
+
+    Correção aplicada:
+    - Antes algumas rotas chamavam render_upload(user), mas a função aceitava apenas msg.
+    - Outras rotas chamavam render_upload("mensagem de erro").
+    - Agora a função aceita os dois formatos sem quebrar o Render.
+    """
+    if isinstance(user, str) and not msg:
+        msg = user
+        user = None
+    user = user or {}
+
+    return f"""<!doctype html><html lang='pt-br'><head><meta charset='utf-8'><title>Dashboard SLA SIN</title>{CSS}</head><body><div class='wrap'><div class='hero'><h1>Dashboard SLA SIN</h1><p>Área ADM: suba a planilha Excel uma vez ao dia. Clientes consultam apenas suas demandas.</p></div>{'<div class=err>'+html.escape(str(msg))+'</div>' if msg else ''}<form class='upload' method='post' enctype='multipart/form-data' action='/analisar'><input type='file' name='file' accept='.xlsx,.xlsm' required><button>Analisar planilha</button></form><div class='note'>Colunas usadas: Rastreamento C, I, K, R, S, Y, AB, AC, AD, AF código cliente, AG nome cliente e aba de feriados.</div></div></body></html>"""
 
 
 def clientes_options_from_rows(rows, selected_codigo=""):
