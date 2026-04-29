@@ -1314,7 +1314,7 @@ class App(BaseHTTPRequestHandler):
             if user.get("tipo") != "admin":
                 self.redirect("/dashboard")
                 return
-            self.send_html(render_upload())
+            self.send_html(render_upload(user))
             return
 
         if parsed.path == "/usuarios":
