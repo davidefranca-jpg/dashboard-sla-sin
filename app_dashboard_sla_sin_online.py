@@ -29,8 +29,19 @@ except Exception:
 
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", 8090))
-APP_DIR = r"C:\IA\Projeto"
-UPLOAD_DIR = os.path.join(APP_DIR, "uploads_sla") if os.name == "nt" else tempfile.gettempdir()
+
+# Pasta principal do sistema.
+# Windows local: C:\IA\Projeto
+# Online: usa APP_DIR se existir; se não existir, usa a própria pasta do arquivo.
+# Isso evita salvar usuários em pasta temporária, que pode ser limpa e apagar senhas/logins.
+if os.name == "nt":
+    APP_DIR = os.environ.get("APP_DIR", r"C:\IA\Projeto")
+else:
+    APP_DIR = os.environ.get("APP_DIR", os.path.dirname(os.path.abspath(__file__)))
+
+os.makedirs(APP_DIR, exist_ok=True)
+
+UPLOAD_DIR = os.environ.get("UPLOAD_DIR", os.path.join(APP_DIR, "uploads_sla"))
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # Pasta fixa para guardar a análise processada.
@@ -38,15 +49,22 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 # Quando o servidor reiniciava, dormia ou a plataforma online limpava a memória,
 # o token expirava e a tela pedia para subir a planilha novamente.
 # Agora cada análise fica salva em disco e pode ser consultada durante o dia todo.
-CACHE_DIR = os.path.join(APP_DIR, "cache_sla") if os.name == "nt" else os.path.join(tempfile.gettempdir(), "cache_sla")
+CACHE_DIR = os.environ.get("CACHE_DIR", os.path.join(APP_DIR, "cache_sla"))
 os.makedirs(CACHE_DIR, exist_ok=True)
 CACHE = {}
 
 CACHE_VALID_HOURS = int(os.environ.get("CACHE_VALID_HOURS", "36"))
 
-USERS_FILE = os.path.join(APP_DIR, "usuarios_sla.json") if os.name == "nt" else os.path.join(tempfile.gettempdir(), "usuarios_sla.json")
+# Arquivo fixo dos usuários. Nunca fica em tempfile.
+# Se estava online e as senhas sumiam ao atualizar/subir planilha, normalmente era porque
+# o arquivo de usuários estava sendo salvo em pasta temporária.
+USERS_FILE = os.environ.get("USERS_FILE", os.path.join(APP_DIR, "usuarios_sla.json"))
+USERS_BACKUP_FILE = USERS_FILE + ".bak"
+
+# Sessões persistentes: evita pedir login ao ficar parado, desde que não passe de 24h.
+SESSIONS_FILE = os.environ.get("SESSIONS_FILE", os.path.join(APP_DIR, "sessoes_sla.json"))
 SESSIONS = {}
-SESSION_HOURS = int(os.environ.get("SESSION_HOURS", "12"))
+SESSION_HOURS = int(os.environ.get("SESSION_HOURS", "24"))
 ADMIN_LOGIN = os.environ.get("ADMIN_LOGIN", "admin")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "Admin@123")
 DEFAULT_CLIENT_PASSWORD_SUFFIX = os.environ.get("DEFAULT_CLIENT_PASSWORD_SUFFIX", "@123")
@@ -87,9 +105,31 @@ def load_users():
             return json.load(f)
     except Exception:
         traceback.print_exc()
+        # Recuperação automática pelo backup, caso o arquivo principal fique corrompido.
+        try:
+            if os.path.exists(USERS_BACKUP_FILE):
+                with open(USERS_BACKUP_FILE, "r", encoding="utf-8") as f:
+                    return json.load(f)
+        except Exception:
+            traceback.print_exc()
         return {}
 
 def save_users(users):
+    os.makedirs(os.path.dirname(USERS_FILE) or ".", exist_ok=True)
+
+    # Backup automático antes de sobrescrever.
+    # Assim, mesmo que ocorra algum problema durante atualização da planilha,
+    # o cadastro anterior de usuários/senhas fica preservado em usuarios_sla.json.bak.
+    try:
+        if os.path.exists(USERS_FILE):
+            with open(USERS_FILE, "r", encoding="utf-8") as fsrc:
+                old_data = fsrc.read()
+            if old_data.strip():
+                with open(USERS_BACKUP_FILE, "w", encoding="utf-8") as fbkp:
+                    fbkp.write(old_data)
+    except Exception:
+        traceback.print_exc()
+
     tmp = USERS_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(users, f, ensure_ascii=False, indent=2)
@@ -99,6 +139,35 @@ def user_safe(u):
     if not u:
         return None
     return {k: v for k, v in u.items() if k != "senha_hash"}
+
+def load_sessions():
+    global SESSIONS
+    if not os.path.exists(SESSIONS_FILE):
+        SESSIONS = {}
+        return SESSIONS
+    try:
+        with open(SESSIONS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            limite = SESSION_HOURS * 3600
+            agora = now_ts()
+            SESSIONS = {sid: sess for sid, sess in data.items() if agora - sess.get("created", 0) <= limite}
+        else:
+            SESSIONS = {}
+    except Exception:
+        traceback.print_exc()
+        SESSIONS = {}
+    return SESSIONS
+
+def save_sessions():
+    try:
+        os.makedirs(os.path.dirname(SESSIONS_FILE) or ".", exist_ok=True)
+        tmp = SESSIONS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(SESSIONS, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, SESSIONS_FILE)
+    except Exception:
+        traceback.print_exc()
 
 def get_session_user(handler):
     cookie_header = handler.headers.get("Cookie", "")
@@ -113,11 +182,14 @@ def get_session_user(handler):
     if not sid:
         return None
     sid = sid.value
+    if not SESSIONS:
+        load_sessions()
     session = SESSIONS.get(sid)
     if not session:
         return None
     if now_ts() - session.get("created", 0) > SESSION_HOURS * 3600:
         SESSIONS.pop(sid, None)
+        save_sessions()
         return None
     users = load_users()
     login = session.get("login")
@@ -129,11 +201,25 @@ def get_session_user(handler):
     return u
 
 def create_session(handler, login):
+    # Cookie sem Max-Age: o navegador apaga ao fechar.
+    # No servidor a sessão fica válida por SESSION_HOURS, padrão 24h.
     sid = secrets.token_urlsafe(32)
     SESSIONS[sid] = {"login": login, "created": now_ts()}
-    handler.send_header("Set-Cookie", f"sid={sid}; Path=/; HttpOnly; SameSite=Lax; Max-Age={SESSION_HOURS*3600}")
+    save_sessions()
+    handler.send_header("Set-Cookie", f"sid={sid}; Path=/; HttpOnly; SameSite=Lax")
 
 def clear_session(handler):
+    cookie_header = handler.headers.get("Cookie", "")
+    if cookie_header:
+        try:
+            cookie = SimpleCookie()
+            cookie.load(cookie_header)
+            sid = cookie.get("sid")
+            if sid:
+                SESSIONS.pop(sid.value, None)
+                save_sessions()
+        except Exception:
+            pass
     handler.send_header("Set-Cookie", "sid=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
 
 
@@ -1856,6 +1942,7 @@ class App(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     load_users()
+    load_sessions()
     print("Dashboard SLA SIN iniciado")
     print(f"Abra no navegador: http://{HOST}:{PORT}")
     print(f"Login admin inicial: {ADMIN_LOGIN}")
