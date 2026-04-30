@@ -162,19 +162,48 @@ def auto_create_client_users(rows):
     Login gerado: cliente_<codigo>
     Senha inicial: <codigo>@123
     A senha fica criptografada no arquivo usuarios_sla.json.
+
+    CORREÇÃO IMPORTANTE:
+    - Ao subir uma nova base, os logins antigos NÃO são apagados.
+    - Se o cliente já existir, o sistema apenas atualiza código/nome quando necessário.
+    - Funcionários e usuários criados manualmente pelo ADM continuam preservados.
     """
     users = load_users()
     created = []
+    changed = False
+
+    if ADMIN_LOGIN not in users:
+        users[ADMIN_LOGIN] = {
+            "senha_hash": hash_password(ADMIN_PASSWORD),
+            "tipo": "admin",
+            "nome": "Administrador",
+            "cliente_codigo": "",
+            "cliente_nome": "",
+            "trocar_senha": False,
+        }
+        changed = True
+
     for r in rows:
         codigo = normalize_cliente_codigo(r.get("cliente_codigo", ""))
         nome = norm_text(r.get("cliente_nome", ""))
         if not codigo:
             continue
+
         login = cliente_login_from_codigo(codigo)
+
         if login in users:
-            if nome and not users[login].get("cliente_nome"):
-                users[login]["cliente_nome"] = nome
+            # Nunca recria nem reseta senha de cliente já existente.
+            # Apenas completa/atualiza dados cadastrais sem apagar nada.
+            if users[login].get("tipo") == "cliente":
+                if users[login].get("cliente_codigo") != codigo:
+                    users[login]["cliente_codigo"] = codigo
+                    changed = True
+                if nome and users[login].get("cliente_nome") != nome:
+                    users[login]["cliente_nome"] = nome
+                    users[login]["nome"] = nome
+                    changed = True
             continue
+
         senha_inicial = f"{codigo}{DEFAULT_CLIENT_PASSWORD_SUFFIX}"
         users[login] = {
             "senha_hash": hash_password(senha_inicial),
@@ -185,9 +214,27 @@ def auto_create_client_users(rows):
             "trocar_senha": True,
         }
         created.append((login, senha_inicial, codigo, nome))
-    if created:
+        changed = True
+
+    if changed:
         save_users(users)
     return created
+
+def usuarios_clientes_cadastrados():
+    """Retorna todos os clientes já cadastrados no arquivo persistente de usuários."""
+    users = load_users()
+    clientes = {}
+    for login, u in users.items():
+        if u.get("tipo") != "cliente":
+            continue
+        codigo = normalize_cliente_codigo(u.get("cliente_codigo", ""))
+        if not codigo:
+            continue
+        clientes[codigo] = {
+            "login": login,
+            "nome": norm_text(u.get("cliente_nome", "")) or norm_text(u.get("nome", "")),
+        }
+    return clientes
 
 def latest_file_path():
     return os.path.join(CACHE_DIR, "_latest_token.json")
@@ -984,29 +1031,58 @@ def render_change_password(user, msg=""):
     </div></body></html>"""
 
 def render_clientes_admin(rows, created_users=None):
-    clientes = {}
+    clientes_base = {}
     for r in rows:
         codigo = normalize_cliente_codigo(r.get("cliente_codigo", ""))
         if not codigo:
             continue
-        if codigo not in clientes:
-            clientes[codigo] = {"nome": r.get("cliente_nome", ""), "qtd": 0}
-        clientes[codigo]["qtd"] += 1
-    itens = sorted(clientes.items(), key=lambda x: x[1]["qtd"], reverse=True)
+        if codigo not in clientes_base:
+            clientes_base[codigo] = {"nome": r.get("cliente_nome", ""), "qtd": 0}
+        clientes_base[codigo]["qtd"] += 1
+
+    clientes_cadastrados = usuarios_clientes_cadastrados()
+
+    # Mostra a união entre clientes da base atual e clientes já cadastrados anteriormente.
+    # Assim o ADM não tem a impressão de que logins antigos sumiram quando sobe uma base menor/nova.
+    todos_codigos = set(clientes_base.keys()) | set(clientes_cadastrados.keys())
+    itens = []
+    for codigo in todos_codigos:
+        base_info = clientes_base.get(codigo, {})
+        user_info = clientes_cadastrados.get(codigo, {})
+        itens.append((codigo, {
+            "nome": base_info.get("nome") or user_info.get("nome", ""),
+            "login": user_info.get("login") or cliente_login_from_codigo(codigo),
+            "qtd": base_info.get("qtd", 0),
+            "na_base": "SIM" if codigo in clientes_base else "NÃO",
+            "cadastrado": "SIM" if codigo in clientes_cadastrados else "NÃO",
+        }))
+
+    itens = sorted(itens, key=lambda x: (x[1]["na_base"] != "SIM", -x[1]["qtd"], x[1]["nome"] or x[0]))
     trs = []
-    for codigo, info in itens[:300]:
-        login = cliente_login_from_codigo(codigo)
-        trs.append(f"<tr><td>{html.escape(codigo)}</td><td>{html.escape(info['nome'])}</td><td>{html.escape(login)}</td><td>{info['qtd']}</td></tr>")
+    for codigo, info in itens[:500]:
+        trs.append(
+            f"<tr>"
+            f"<td>{html.escape(codigo)}</td>"
+            f"<td>{html.escape(info['nome'])}</td>"
+            f"<td>{html.escape(info['login'])}</td>"
+            f"<td>{info['qtd']}</td>"
+            f"<td>{info['na_base']}</td>"
+            f"<td>{info['cadastrado']}</td>"
+            f"</tr>"
+        )
+
     novos = ""
     if created_users:
         linhas = "".join(f"<tr><td>{html.escape(a)}</td><td>{html.escape(b)}</td><td>{html.escape(c)}</td><td>{html.escape(d)}</td></tr>" for a,b,c,d in created_users[:300])
-        novos = f"<div class='card'><h2>Novos usuários criados</h2><p class='sub'>Senha inicial gerada. Oriente o cliente a trocar no primeiro acesso.</p><div class='tablebox'><table><tr><th>Login</th><th>Senha inicial</th><th>Código</th><th>Cliente</th></tr>{linhas}</table></div></div>"
+        novos = f"<div class='card'><h2>Novos usuários criados</h2><p class='sub'>Senha inicial gerada. Clientes antigos foram preservados e não tiveram senha resetada.</p><div class='tablebox'><table><tr><th>Login</th><th>Senha inicial</th><th>Código</th><th>Cliente</th></tr>{linhas}</table></div></div>"
+
     return f"""<!doctype html><html lang='pt-br'><head><meta charset='utf-8'><title>Clientes</title>{CSS}</head><body>
     <div class='wrap wide'>
-        <div class='top'><div><h1>Clientes identificados</h1><p>Baseada na aba Rastreamento: AF código cliente e AG nome cliente.</p></div><div class='actions'><a class='btn secondary' href='/dashboard'>Voltar</a><a class='btn secondary' href='/logout'>Sair</a></div></div>
+        <div class='top'><div><h1>Clientes identificados</h1><p>Base atual + logins de clientes já cadastrados no sistema.</p></div><div class='actions'><a class='btn secondary' href='/dashboard'>Voltar</a><a class='btn secondary' href='/usuarios'>Usuários</a><a class='btn secondary' href='/logout'>Sair</a></div></div>
         {novos}
-        <div class='card'><h2>Relação de clientes</h2><div class='tablebox'><table><tr><th>Código Cliente</th><th>Nome Cliente</th><th>Login</th><th>Demandas</th></tr>{''.join(trs)}</table></div></div>
+        <div class='card'><h2>Relação de clientes e logins preservados</h2><p class='sub'>Se aparecer “Na base atual = NÃO”, o login continua cadastrado, apenas não veio na última planilha enviada.</p><div class='tablebox'><table><tr><th>Código Cliente</th><th>Nome Cliente</th><th>Login</th><th>Demandas na base atual</th><th>Na base atual</th><th>Login cadastrado</th></tr>{''.join(trs)}</table></div></div>
     </div></body></html>"""
+
 
 
 def render_usuarios_admin(msg=""):
@@ -1163,7 +1239,7 @@ def render_dashboard(rows, token, user=None, all_rows=None, cliente_filtro=''):
     ])
 
     filtro_cliente_html = ""
-    if (user or {}).get("tipo") == "admin":
+    if (user or {}).get("tipo") in ("admin", "funcionario"):
         filtro_titulo = "Todos os clientes"
         if cliente_filtro:
             filtro_titulo = f"{cliente_filtro} - {cliente_nome_filtro}" if cliente_nome_filtro else cliente_filtro
@@ -1552,9 +1628,10 @@ class App(BaseHTTPRequestHandler):
                 else:
                     self.send_html(render_login("Nenhuma pesquisa disponível para seu cliente no momento."), 404)
                 return
-            cliente_filtro = qs.get("cliente", [""])[0] if user.get("tipo") == "admin" else ""
-            if user.get("tipo") == "admin" and cliente_filtro:
-                rows_user = filtrar_por_cliente_admin(rows, cliente_filtro)
+            cliente_filtro = qs.get("cliente", [""])[0] if user.get("tipo") in ("admin", "funcionario") else ""
+            if user.get("tipo") in ("admin", "funcionario") and cliente_filtro:
+                rows_base_user = filter_rows_for_user(rows, user)
+                rows_user = filtrar_por_cliente_admin(rows_base_user, cliente_filtro)
             else:
                 rows_user = filter_rows_for_user(rows, user)
             self.send_html(render_dashboard(rows_user, token, user, all_rows=rows, cliente_filtro=cliente_filtro))
@@ -1568,9 +1645,10 @@ class App(BaseHTTPRequestHandler):
             if not rows:
                 self.send_html(render_login("Análise não encontrada ou vencida."), 404)
                 return
-            cliente_filtro = qs.get("cliente", [""])[0] if user.get("tipo") == "admin" else ""
-            if user.get("tipo") == "admin" and cliente_filtro:
-                rows_user = filtrar_por_cliente_admin(rows, cliente_filtro)
+            cliente_filtro = qs.get("cliente", [""])[0] if user.get("tipo") in ("admin", "funcionario") else ""
+            if user.get("tipo") in ("admin", "funcionario") and cliente_filtro:
+                rows_base_user = filter_rows_for_user(rows, user)
+                rows_user = filtrar_por_cliente_admin(rows_base_user, cliente_filtro)
             else:
                 rows_user = filter_rows_for_user(rows, user)
             self.send_html(render_detail_page(rows_user, token, tipo, user, cliente_filtro))
@@ -1585,9 +1663,10 @@ class App(BaseHTTPRequestHandler):
                 self.send_html(render_login("Análise não encontrada ou vencida."), 404)
                 return
 
-            cliente_filtro = qs.get("cliente", [""])[0] if user.get("tipo") == "admin" else ""
-            if user.get("tipo") == "admin" and cliente_filtro:
-                rows = filtrar_por_cliente_admin(rows, cliente_filtro)
+            cliente_filtro = qs.get("cliente", [""])[0] if user.get("tipo") in ("admin", "funcionario") else ""
+            if user.get("tipo") in ("admin", "funcionario") and cliente_filtro:
+                rows_base_user = filter_rows_for_user(rows, user)
+                rows = filtrar_por_cliente_admin(rows_base_user, cliente_filtro)
             else:
                 rows = filter_rows_for_user(rows, user)
             filters = {
